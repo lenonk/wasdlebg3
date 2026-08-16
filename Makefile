@@ -12,8 +12,8 @@ $(BUILD):
 
 # The shim itself. Exported visibility on SDL_PollEvent only — everything else
 # stays hidden so we cannot accidentally interpose a symbol the game relies on.
-$(BUILD)/bg3le.so: src/bg3le.c src/symres.c src/sigscan.c src/symres.h src/sigscan.h | $(BUILD)
-	$(CC) $(CFLAGS) -fPIC -shared -o $@ src/bg3le.c src/symres.c src/sigscan.c $(SDL_CFLAGS) -ldl
+$(BUILD)/bg3le.so: src/bg3le.c src/symres.c src/sigscan.c src/hook.c src/symres.h src/sigscan.h src/hook.h | $(BUILD)
+	$(CC) $(CFLAGS) -fPIC -shared -o $@ src/bg3le.c src/symres.c src/sigscan.c src/hook.c $(SDL_CFLAGS) -ldl
 
 $(BUILD)/test_symres: src/test_symres.c src/symres.c src/symres.h | $(BUILD)
 	$(CC) $(CFLAGS) -fPIE -pie -o $@ src/test_symres.c src/symres.c
@@ -21,9 +21,10 @@ $(BUILD)/test_symres: src/test_symres.c src/symres.c src/symres.h | $(BUILD)
 $(BUILD)/sdl_harness: test/sdl_harness.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $< $(SDL_CFLAGS) $(SDL_LIBS)
 
-test: $(BUILD)/test_symres $(BUILD)/test_sigscan $(BUILD)/bg3le.so $(BUILD)/sdl_harness
+test: $(BUILD)/test_symres $(BUILD)/test_sigscan $(BUILD)/test_hook $(BUILD)/bg3le.so $(BUILD)/sdl_harness
 	@./$(BUILD)/test_symres
 	@./$(BUILD)/test_sigscan
+	@./$(BUILD)/test_hook
 	@echo
 	@./test/run_shim_test.sh $(BUILD)
 
@@ -35,3 +36,6 @@ $(BUILD)/test_sigscan: src/test_sigscan.c src/sigscan.c src/sigscan.h | $(BUILD)
 
 $(BUILD)/bg3le-check: src/check.c src/sigscan.c src/sigscan.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/check.c src/sigscan.c
+
+$(BUILD)/test_hook: src/test_hook.c src/hook.c src/hook.h | $(BUILD)
+	$(CC) $(CFLAGS) -fcf-protection=none -o $@ src/test_hook.c src/hook.c

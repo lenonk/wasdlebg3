@@ -25,6 +25,7 @@ int bg3_find_move_sig(const uint8_t *code, size_t len, uintptr_t base_va, bg3_mo
 
 /* Live movement state, derived from a signature match. */
 typedef struct {
+    uintptr_t block;        /* base of the state block the game allocated */
     volatile float *vec;    /* [0] = strafe (right positive), [1] = forward (backward positive) */
     volatile uint8_t *flag; /* nonzero => the game uses vec instead of polling input */
 } bg3_move_ctl;

@@ -84,6 +84,7 @@ int bg3_move_ctl_resolve(const bg3_move_sig *sig, bg3_move_ctl *out)
 {
     uintptr_t block = *(uintptr_t *)sig->global_slot;
     if (!block) return 0;   /* not allocated yet — caller retries */
+    out->block = block;
     out->vec = (volatile float *)(block + sig->vec_off);
     out->flag = (volatile uint8_t *)(block + sig->flag_off);
     return 1;

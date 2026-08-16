@@ -20,6 +20,7 @@
  *   BG3LE_FORCE=0|1      write even if the engine looks uninitialised (default 0)
  */
 #define _GNU_SOURCE
+#include "hook.h"
 #include "sigscan.h"
 #include "symres.h"
 
@@ -39,7 +40,17 @@ static int (*real_poll)(SDL_Event *);
 
 static FILE *g_logf;
 static int g_mirror_stderr;
-static int cfg_suppress, cfg_move, cfg_verbose, cfg_force;
+static int cfg_suppress, cfg_move, cfg_verbose, cfg_force, cfg_hook;
+
+/* Counts calls to the game's movement-input fetch. If this stays at zero while
+ * keys are held, the game simply never asks for movement input in this mode —
+ * which no amount of writing to the state block could fix. */
+static bg3_hook g_hook;
+static int g_hooked;
+
+/* A gate on the same state block, checked by another caller of the input fetch:
+ *   cmp dword [block+0xe98], 0 ; je <skip the call>                          */
+#define GATE_OFF 0xe98
 
 static int g_is_bg3;
 static bg3_move_sig g_sig;
@@ -134,6 +145,17 @@ static void identify_host(void)
     lg("state ptr @%#lx, vec +%#x, flag +%#x",
        g_sig.global_slot, g_sig.vec_off, g_sig.flag_off);
 
+    if (cfg_hook) {
+        /* The prologue starts 10 bytes before the signature match. We verify the
+         * bytes before patching, so a wrong guess refuses rather than corrupts. */
+        static const uint8_t prologue[5] = {0x55, 0x41, 0x57, 0x41, 0x56};
+        uintptr_t fn = g_sig.match_va - 10;
+        int rc2 = bg3_hook_count_calls(fn, prologue, &g_hook);
+        g_hooked = (rc2 == BG3_HOOK_OK);
+        lg("call counter on GetMoveInput @%#lx: %s (rc=%d)", fn,
+           g_hooked ? "installed" : "NOT installed", rc2);
+    }
+
     /* Best effort from here on. Resolve the ECS probes now but read them later:
      * at constructor time the engine has not registered its types yet, so every
      * index is still zero and tells us nothing. */
@@ -181,12 +203,25 @@ static void tick(void)
     if (!g_is_bg3) return;
     g_frames++;
 
-    if (!g_have_ctl && g_have_sig) {
-        /* The state block is allocated during startup, so this is null for a while. */
-        if (bg3_move_ctl_resolve(&g_sig, &g_ctl)) {
-            g_have_ctl = 1;
-            lg("state block resolved on frame %lu: vec @%p flag @%p (flag currently %u)",
-               g_frames, (void *)g_ctl.vec, (void *)g_ctl.flag, *g_ctl.flag);
+    /* Re-resolve every frame rather than caching: if the game ever reallocates
+     * this block we would otherwise spend the rest of the session writing into
+     * freed memory and wondering why nothing moved. */
+    if (g_have_sig) {
+        bg3_move_ctl now;
+        if (bg3_move_ctl_resolve(&g_sig, &now)) {
+            if (!g_have_ctl) {
+                g_have_ctl = 1;
+                g_ctl = now;
+                lg("state block resolved on frame %lu: block %#lx, flag currently %u",
+                   g_frames, now.block, *now.flag);
+            } else if (now.block != g_ctl.block) {
+                lg("state block MOVED on frame %lu: %#lx -> %#lx",
+                   g_frames, g_ctl.block, now.block);
+                g_ctl = now;
+            }
+        } else if (g_have_ctl) {
+            lg("state block pointer went NULL on frame %lu", g_frames);
+            g_have_ctl = 0;
         }
     }
 
@@ -197,11 +232,16 @@ static void tick(void)
            g_ti_movement ? *g_ti_movement : 0);
     }
 
-    if (g_frames % HEARTBEAT_FRAMES == 0)
-        lg("frame %lu: block=%s engine=%s ecs(%u,%u) keys(w%d a%d s%d d%d)",
-           g_frames, g_have_ctl ? "live" : "null", engine_ready() ? "up" : "waiting",
-           g_ti_character ? *g_ti_character : 0, g_ti_movement ? *g_ti_movement : 0,
+    if (g_frames % HEARTBEAT_FRAMES == 0) {
+        unsigned gate = g_have_ctl ? *(volatile uint32_t *)(g_ctl.block + GATE_OFF) : 0;
+        lg("frame %lu: block=%s gate[+0xe98]=%u calls=%llu readback vec=(%.2f,%.2f) flag=%u keys(w%d a%d s%d d%d)",
+           g_frames, g_have_ctl ? "live" : "null", gate,
+           g_hooked ? (unsigned long long)*g_hook.counter : 0ULL,
+           g_have_ctl ? (double)g_ctl.vec[0] : 0.0,
+           g_have_ctl ? (double)g_ctl.vec[1] : 0.0,
+           g_have_ctl ? *g_ctl.flag : 0,
            held.w, held.a, held.s, held.d);
+    }
 
     if (!cfg_move || !g_have_ctl)
         return;
@@ -285,6 +325,11 @@ __attribute__((destructor)) static void bg3le_fini(void)
         *g_ctl.flag = 0;
         lg("cleared movement flag on unload");
     }
+    if (g_hooked) {
+        lg("GetMoveInput was called %llu times this session",
+           (unsigned long long)*g_hook.counter);
+        bg3_hook_remove(&g_hook);
+    }
 }
 
 /* Steam's container runtime may not give us a writable $HOME, and if the log
@@ -320,6 +365,7 @@ __attribute__((constructor)) static void bg3le_init(void)
     cfg_move = envflag("BG3LE_MOVE", 1);
     cfg_verbose = envflag("BG3LE_VERBOSE", 0);
     cfg_force = envflag("BG3LE_FORCE", 0);
+    cfg_hook = envflag("BG3LE_HOOK", 1);
     if (cfg_verbose && g_logf != stderr) g_mirror_stderr = 1;
 
     identify_host();
