@@ -38,6 +38,7 @@
 static int (*real_poll)(SDL_Event *);
 
 static FILE *g_logf;
+static int g_mirror_stderr;
 static int cfg_suppress, cfg_move, cfg_verbose, cfg_force;
 
 static int g_is_bg3;
@@ -77,6 +78,14 @@ static void lg(const char *fmt, ...)
     va_end(ap);
     fputc('\n', g_logf);
     fflush(g_logf);
+
+    if (g_mirror_stderr) {
+        va_start(ap, fmt);
+        fputs("bg3le: ", stderr);
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+        fputc('\n', stderr);
+    }
 }
 
 struct exec_range { const uint8_t *code; size_t len; uintptr_t va; };
@@ -278,15 +287,40 @@ __attribute__((destructor)) static void bg3le_fini(void)
     }
 }
 
+/* Steam's container runtime may not give us a writable $HOME, and if the log
+ * cannot be opened we would vanish without trace. Fall back through candidates,
+ * and mirror to stderr so something survives even when every file fails. */
+static void open_log(void)
+{
+    const char *want = getenv("BG3LE_LOG");
+    const char *tries[3];
+    int n = 0;
+    if (want) tries[n++] = want;
+    tries[n++] = "/tmp/bg3le.log";
+
+    for (int i = 0; i < n; i++) {
+        g_logf = fopen(tries[i], "ae");
+        if (g_logf) {
+            if (i > 0) {
+                fprintf(stderr, "bg3le: could not write %s, using %s\n", want, tries[i]);
+                g_mirror_stderr = 1;
+            }
+            return;
+        }
+    }
+    g_logf = stderr;
+    g_mirror_stderr = 0;   /* already stderr; do not double up */
+    fprintf(stderr, "bg3le: no writable log file, logging to stderr\n");
+}
+
 __attribute__((constructor)) static void bg3le_init(void)
 {
-    const char *path = getenv("BG3LE_LOG");
-    g_logf = path ? fopen(path, "ae") : stderr;
-    if (!g_logf) g_logf = stderr;
+    open_log();
     cfg_suppress = envflag("BG3LE_SUPPRESS", 1);
     cfg_move = envflag("BG3LE_MOVE", 1);
     cfg_verbose = envflag("BG3LE_VERBOSE", 0);
     cfg_force = envflag("BG3LE_FORCE", 0);
+    if (cfg_verbose && g_logf != stderr) g_mirror_stderr = 1;
 
     identify_host();
     if (g_is_bg3)
