@@ -1,54 +1,196 @@
-# bg3le — a native Linux script extender for Baldur's Gate 3
+# wasdlebg3
 
-Norbyte's BG3 Script Extender is Windows-only; on Linux you get it by running the
-Windows build under Proton. This project targets the **native Linux BG3 executable**
-directly, using `LD_PRELOAD` instead of DLL injection. The first feature is WASD
-character movement.
+**WASD movement for the native Linux build of Baldur's Gate 3.** No Proton, no Windows
+Script Extender, no remapping your keybinds.
 
-## Status
+Your character walks with W/A/S/D through the game's *own* movement code — the same path
+an analog stick drives — so you get real locomotion, animation and collision rather than
+synthesised mouse clicks. Movement is camera-relative: forward means away from the camera.
 
-Early. What exists and is tested:
+Ships as a single `LD_PRELOAD` library, `bg3le.so`. It patches nothing on disk and leaves
+no trace after you quit.
 
-- **`src/symres.c`** — resolves BG3's *unexported* internal symbols at runtime.
-  The game's own functions and its ECS type-index statics live in `.symtab`, which the
-  loader never maps and `dlsym()` cannot see, so this re-reads the executable from disk
-  and applies the process's load bias (via `dl_iterate_phdr`, which is ASLR- and
-  PIE-correct). Resolving from the 152,416-symbol table takes about 13 ms.
-- **`src/bg3le.c`** — the preloaded shim. Interposes `SDL_PollEvent`, tracks WASD state,
-  optionally hides those keys from the game, and can synthesise analog stick motion.
-- **`test/`** — a stand-in "game" that proves suppression and injection work.
-  **No copy of BG3 is required to run the tests**, and no display is needed.
+> **Status:** working and in use, but young. Version 0.1.0. Single-player only — see
+> [Scope and safety](#scope-and-safety).
 
-## Why `SDL_PollEvent` is the whole input story
+---
 
-The binary imports `SDL_PollEvent` and nothing else that can read input:
-no `SDL_PeepEvents`, `SDL_WaitEvent`, `SDL_AddEventWatch`, `SDL_SetEventFilter`,
-and notably no `SDL_GetKeyboardState`. Every keystroke, mouse motion and controller
-axis the game will ever see passes through that one function, so interposing it gives
-exact control rather than a best-effort race.
+## Requirements
 
-## Build and test
+- The **native Linux** build of Baldur's Gate 3. If your install only has `bg3.exe`,
+  this is not for you — that's the Windows build, and Norbyte's
+  [Script Extender](https://github.com/Norbyte/bg3se) is what you want instead.
+- glibc 2.34 or newer (any distro from 2021 onward).
+- SDL2 headers if you build from source (`libsdl2-dev` / `SDL2-devel`).
+
+Verify your game is supported before doing anything else:
 
 ```sh
-sudo apt install libsdl2-dev            # plus a C compiler
-make test
+./bg3le-check "/path/to/Baldurs Gate 3"
 ```
 
-`make test` runs both suites and asserts on the results.
+Point it at the game folder or the executable — given a folder it finds `bin/bg3` itself.
+You want `GOOD — this build is supported`. If it says otherwise, please
+[open an issue](https://github.com/Nerocon/wasdlebg3/issues) with the output; that tool
+prints everything needed to add support for another build.
 
-## Analysis workspace
+## Install
 
-`analysis/` holds the reverse-engineering tooling. `build_index.py` parses the binary's
-`.symtab` and its surviving `.rela.text` relocations into a SQLite database
-(152,416 symbols and 2,986,688 cross-references); `bg3q.py` queries it and disassembles
-with reloc-derived symbol names. See `analysis/BINARY-FACTS.md` for what the binary does
-and does not give us.
+```sh
+git clone https://github.com/Nerocon/wasdlebg3
+cd wasdlebg3
+make
+./install.sh
+```
 
-The database is derived from Larian's copyrighted executable and is gitignored. Nothing
-derived from the game binary is published here — the mod ships as source that reads the
-user's own installed copy.
+`install.sh` copies the library to `~/.local/share/bg3le/` and prints the exact Steam
+launch options to paste. Or do it by hand:
 
-## Scope
+```sh
+mkdir -p ~/bg3le && cp build/bg3le.so ~/bg3le/
+```
 
-Single-player use. Injecting input into multiplayer sessions is not a goal and is likely
-to desync; see the design document for the reasoning.
+Then set this as the game's **Steam launch options** (Properties → General):
+
+```
+LD_PRELOAD=/home/YOURNAME/bg3le/bg3le.so %command%
+```
+
+Use an absolute path with no spaces in it — Steam launch options cannot be quoted, which
+is why the library does not live in the game folder (that path has spaces).
+
+Launch the game and hold **W**. That's it.
+
+## Controls
+
+| input | what it does |
+|---|---|
+| **W A S D** | move, relative to the camera |
+| **Left Shift** (hold) | walk instead of run |
+| everything else | untouched — jump, interact, hotbar, camera all work normally |
+
+WASD are hidden from the game while you move, so they no longer pan the camera. Everything
+else passes through in order. Typing in a text field (naming a save, renaming a character)
+temporarily disables movement so your keystrokes reach the box, and losing window focus
+releases movement so alt-tabbing with W held doesn't walk you into a lake.
+
+## Configuration
+
+All configuration is environment variables, so it fits in a Steam launch option. Defaults
+are what you want; the rest are for troubleshooting.
+
+| variable | default | meaning |
+|---|---|---|
+| `BG3LE_WALK_KEY` | `lshift` | walk modifier: `lshift` `rshift` `lctrl` `rctrl` `lalt` `ralt` `capslock` `tab` `none` |
+| `BG3LE_WALK_SPEED` | `0.5` | walk speed as a fraction of run, between 0 and 1 |
+| `BG3LE_SUPPRESS` | `1` | hide WASD from the game's own bindings |
+| `BG3LE_MOVE` | `1` | drive movement (`0` = observe only) |
+| `BG3LE_GATE` | `1` | open the game's controller-mode gate (`0` disables the mod) |
+| `BG3LE_LOG` | `/tmp/bg3le.log` | log file |
+| `BG3LE_TRACE` | `0` | per-keystroke and per-frame detail |
+| `BG3LE_VERBOSE` | `0` | also log from Steam's helper processes |
+
+Example — walk on Ctrl at 30% speed:
+
+```
+BG3LE_WALK_KEY=lctrl BG3LE_WALK_SPEED=0.3 LD_PRELOAD=/home/YOURNAME/bg3le/bg3le.so %command%
+```
+
+## Troubleshooting
+
+Run `./diagnose.sh`. It is read-only, launches nothing, and reports whether the library
+loads, your glibc version, every log on the system, the launch options **as Steam actually
+stored them**, whether a running BG3 is native or Proton, and what your install contains.
+Paste the whole output into an issue.
+
+A few specifics:
+
+**No log file at all.** The library opens its log before it decides anything, so a missing
+file means `LD_PRELOAD` never reached any process — almost always the launch options. Check
+`diagnose.sh` section 5, which reads what Steam saved rather than what you think you typed.
+Close Steam first; it writes that file lazily.
+
+**The log exists but says nothing.** Steam re-execs through a dozen helper processes and the
+library stays silent in all of them. `BG3LE_VERBOSE=1` shows them.
+
+**Movement does nothing.** Set `BG3LE_TRACE=1` and look for `opened 1 of 1 movement gate(s)`
+and `movement control live`. If the gate did not open, the game build likely differs from
+what the signature expects — run `bg3le-check` and file the output.
+
+**Bypassing Steam entirely.** `./run-bg3le.sh "/path/to/Baldurs Gate 3"` launches the game
+directly with the right environment, which removes Steam's launch options and container from
+the picture. Leave Steam running in the background.
+
+## Scope and safety
+
+**Single-player.** The client streams a derived position and heading to the server, and
+injecting movement in co-op is untested and plausibly desyncs. Don't.
+
+**Saves are not at risk** in any way we can see: the mod writes one transient input vector
+per frame and touches no persistent state. It also patches six bytes of code in memory —
+never on disk — and restores them when the game exits.
+
+**Not a cheat.** It drives the same input path a gamepad uses. It does not alter stats,
+rolls, speed beyond the game's own run speed, or anything the server validates.
+
+## How it works
+
+Three facts about the binary carry the whole design, each verified against it:
+
+1. **`SDL_PollEvent` is the game's only input ingress.** It imports no `SDL_PeepEvents`,
+   `SDL_WaitEvent`, `SDL_AddEventWatch`, `SDL_SetEventFilter`, not even
+   `SDL_GetKeyboardState` — and it has exactly one call site. Interposing that one function
+   gives exact control of every keystroke plus a once-per-frame main-thread tick.
+
+2. **A forced-input override already exists.** The movement-input fetch checks it *before*
+   polling `CharacterMoveForward/Backward/Left/Right`, and it is consumed upstream of the
+   deadzone, normalise and camera rotation. So we write a camera-relative vector exactly
+   like stick deflection — and because magnitudes below 1.0 survive the normalise step, a
+   shorter vector is a genuine walk rather than a clamped run.
+
+3. **That path is gated by one branch.** A `cmp`/`je` on a controller-mode flag skips it
+   entirely outside controller mode. Writing the flag loses a per-frame race against the
+   engine's input-mode arbiter — measured, it reset ours on every single frame — so the
+   six-byte branch is NOPed instead, as a single aligned atomic store.
+
+**No addresses are hardcoded.** At load time the library finds its signature, recovers the
+global and both field offsets from instruction encodings, derives the mode flag from call
+sites, and locates the gate branch. If anything fails to match it refuses to touch memory.
+That is what should carry it across game patches.
+
+`DESIGN.md` has the full reverse-engineering write-up, including which claims were verified
+directly and which remain assumptions. `analysis/` holds the tooling: a SQLite index of the
+binary's 152,416 symbols and 2,986,688 relocation-derived cross-references, plus query and
+disassembly helpers.
+
+## Building and testing
+
+```sh
+make          # builds build/bg3le.so and build/bg3le-check
+make test     # 41 assertions
+```
+
+The test suite needs **neither a copy of BG3 nor a display**. It exercises the symbol
+resolver against a live PIE, the signature scanner against a real binary if one is present,
+the inline hook against a local function reproducing BG3's exact prologue, and the input
+filter against a stand-in game using SDL's dummy drivers.
+
+## Prior art
+
+- [**Norbyte/bg3se**](https://github.com/Norbyte/bg3se) — the Windows Script Extender.
+  Windows-only by construction: it resolves functions from MSVC byte patterns that cannot
+  match a clang-built Linux binary.
+- [**Ch4nKyy/BG3WASD**](https://github.com/Ch4nKyy/BG3WASD) — the Windows WASD mod. It
+  reaches the same movement actions from a different direction, by remapping keybinds and
+  NOP-ing a controller-mode gate. Independent confirmation that the gate is the right lever.
+- **ahungry/bg3-linux-ae** — the only other public native-Linux BG3 code mod. All four of
+  its byte patterns score zero hits in build 4.1.1.7398727, which is the clearest argument
+  for deriving addresses at runtime instead of hardcoding them.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+This project contains no Larian code or assets. It is interoperability work against a
+binary you own, and it reads that binary from your own installation at runtime.
+Baldur's Gate 3 is © Larian Studios.

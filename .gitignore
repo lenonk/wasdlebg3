@@ -9,3 +9,4 @@ analysis/ghidra_proj/
 build/
 __pycache__/
 *.pyc
+analysis/dossier.json

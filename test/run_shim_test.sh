@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Verifies the LD_PRELOAD shim against a stand-in game, with no display and no
-# copy of BG3 required. Asserts on the harness's RESULT line and on the log.
+# Verifies the LD_PRELOAD shim against a stand-in game. Needs no display and no
+# copy of BG3 — it asserts on what the harness reports SDL_PollEvent handed back.
 set -uo pipefail
 B="${1:-build}"
 export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
 fails=0
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
+
+SHIM=(env BG3LE_LOG=/dev/null LD_PRELOAD=./"$B"/bg3le.so)
 
 check() { # name expected actual
   if [ "$2" = "$3" ]; then
@@ -17,36 +19,46 @@ check() { # name expected actual
   fi
 }
 
-# The harness pushes 6 key events, 4 of them WASD.
 base=$(./"$B"/sdl_harness | grep '^RESULT')
-check "baseline passes all 6 keys through" "RESULT keys=6 axes=0 other=0" "$base"
+check "baseline passes all 6 keys through" "RESULT keys=6 other=0" "$base"
 
-sup=$(BG3LE_LOG=/dev/null LD_PRELOAD=./"$B"/bg3le.so ./"$B"/sdl_harness | grep '^RESULT')
-check "shim hides all 4 WASD keys" "RESULT keys=2 axes=0 other=0" "$sup"
+sup=$("${SHIM[@]}" ./"$B"/sdl_harness | grep '^RESULT')
+check "shim hides all 4 WASD keys" "RESULT keys=2 other=0" "$sup"
 
-off=$(BG3LE_LOG=/dev/null BG3LE_SUPPRESS=0 LD_PRELOAD=./"$B"/bg3le.so \
-      ./"$B"/sdl_harness | grep '^RESULT')
-check "BG3LE_SUPPRESS=0 restores all keys" "RESULT keys=6 axes=0 other=0" "$off"
+off=$("${SHIM[@]}" BG3LE_SUPPRESS=0 ./"$B"/sdl_harness | grep '^RESULT')
+check "BG3LE_SUPPRESS=0 restores all keys" "RESULT keys=6 other=0" "$off"
 
-# Non-movement keys must survive untouched and in order.
-order=$(BG3LE_LOG=/dev/null LD_PRELOAD=./"$B"/bg3le.so ./"$B"/sdl_harness \
-        | awk '/GAME SAW key/{printf "%s ", $4}')
+order=$("${SHIM[@]}" ./"$B"/sdl_harness | awk '/GAME SAW key/{printf "%s ", $4}')
 check "unrelated keys pass through in order" "X Space " "$order"
 
-# Steam re-execs through many helper processes and each inherits LD_PRELOAD.
-# Loading into something that is not the game must produce no log noise at all.
+# The walk modifier is observed, never stolen: the game still needs its binding.
+mod=$("${SHIM[@]}" ./"$B"/sdl_harness modifier)
+check "walk modifier reaches the game" "2" "$(grep -c 'GAME SAW key Left Shift' <<<"$mod")"
+check "...but W does not" "0" "$(grep -c 'GAME SAW key W ' <<<"$mod")"
+
+modoff=$("${SHIM[@]}" BG3LE_WALK_KEY=none ./"$B"/sdl_harness modifier)
+check "BG3LE_WALK_KEY=none still passes the key" "2" \
+      "$(grep -c 'GAME SAW key Left Shift' <<<"$modoff")"
+
+# Typing a save name must not be eaten, and must not walk the character.
+txt=$("${SHIM[@]}" ./"$B"/sdl_harness textinput | grep '^RESULT')
+check "WASD reaches the game while typing" "RESULT keys=4 other=0" "$txt"
+
+# Losing focus with a key held must not leave the character walking.
+foc=$("${SHIM[@]}" BG3LE_TRACE=1 BG3LE_VERBOSE=1 BG3LE_LOG="$TMP/f.log" ./"$B"/sdl_harness focus >/dev/null; \
+      grep -c 'focus lost' "$TMP/f.log")
+check "focus loss releases movement" "1" "$foc"
+
+# Steam re-execs through many helpers; loading into one must be silent.
 : > "$TMP/quiet.log"
 BG3LE_LOG="$TMP/quiet.log" LD_PRELOAD=./"$B"/bg3le.so ./"$B"/sdl_harness >/dev/null
 check "silent in a non-game process" "0" "$(wc -l < "$TMP/quiet.log")"
 
-# ...but must still be diagnosable on demand.
 : > "$TMP/loud.log"
 BG3LE_LOG="$TMP/loud.log" BG3LE_VERBOSE=1 LD_PRELOAD=./"$B"/bg3le.so \
-  ./"$B"/sdl_harness >/dev/null
+  ./"$B"/sdl_harness >/dev/null 2>/dev/null
 check "BG3LE_VERBOSE=1 explains why it went idle" "1" \
       "$(grep -c 'not the game' "$TMP/loud.log")"
-
-# A non-game host must never be mistaken for BG3, so nothing may be written.
 check "never claims to have identified BG3" "0" \
       "$(grep -c 'BG3 identified' "$TMP/loud.log")"
 

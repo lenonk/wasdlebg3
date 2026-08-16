@@ -1,23 +1,30 @@
-/* bg3le — native Linux script extender for Baldur's Gate 3.
+/* bg3le — native Linux WASD movement for Baldur's Gate 3.
  *
- * Loaded with LD_PRELOAD. The input design rests on one verified fact:
- * SDL_PollEvent is the game's only event ingress. It imports no SDL_PeepEvents,
- * SDL_WaitEvent, SDL_AddEventWatch, SDL_SetEventFilter or SDL_GetKeyboardState,
- * so every keystroke, mouse motion and controller axis the game will ever see
- * passes through the one function below. That makes suppression and injection
- * exact rather than best-effort, and gives us a once-per-frame main-thread tick.
+ * Loaded with LD_PRELOAD. Three verified facts carry the whole design:
  *
- * Steam re-execs through a chain of helper processes and every one of them
- * inherits LD_PRELOAD, so the first thing we do is establish whether this
- * process is actually the game and go quiet if it is not.
+ *   1. SDL_PollEvent is the game's ONLY input ingress — it imports no
+ *      SDL_PeepEvents, SDL_WaitEvent, SDL_AddEventWatch, SDL_SetEventFilter and
+ *      no SDL_GetKeyboardState. Interposing it gives exact control of every
+ *      keystroke, plus a once-per-frame tick on the main thread.
  *
- * Configuration is by environment variable so it can be set from a Steam launch
- * option without a config file:
- *   BG3LE_LOG=<path>     append a log here (default: stderr)
- *   BG3LE_MOVE=0|1       drive movement from WASD          (default 1)
- *   BG3LE_SUPPRESS=0|1   hide WASD from the game's hotkeys (default 1)
- *   BG3LE_VERBOSE=0|1    also log from non-game processes  (default 0)
- *   BG3LE_FORCE=0|1      write even if the engine looks uninitialised (default 0)
+ *   2. The game's movement-input fetch checks a forced-input override before it
+ *      polls anything, and that override is consumed upstream of the deadzone,
+ *      normalise and camera rotation. So the vector we write is camera-relative,
+ *      exactly like analog stick deflection, and magnitudes below 1.0 pass
+ *      through unscaled — which is what gives us a walk speed for free.
+ *
+ *   3. That whole path is skipped by one `cmp`/`je` on a controller-mode flag.
+ *      Writing the flag loses a per-frame race against the engine's input-mode
+ *      arbiter (measured: it reset ours on every frame without exception), so
+ *      the branch is NOPed instead.
+ *
+ * Nothing is hardcoded. Every address is derived at load time from instruction
+ * encodings, and the library refuses to touch memory if anything fails to match.
+ *
+ * Steam re-execs through a chain of helpers and each inherits LD_PRELOAD, so the
+ * first thing we do is decide whether this process is the game and go quiet if
+ * it is not. Configuration is by environment variable so it fits in a Steam
+ * launch option; see README.md for the full list.
  */
 #define _GNU_SOURCE
 #include "hook.h"
@@ -32,58 +39,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
-#define HEARTBEAT_FRAMES 600
+#define BG3LE_VERSION "0.1.0"
+#define MAX_GATES 8
+#define HEARTBEAT_FRAMES 1800
 
 static int (*real_poll)(SDL_Event *);
 
+/* ---------------------------------------------------------------- logging */
+
 static FILE *g_logf;
 static int g_mirror_stderr;
-static int cfg_suppress, cfg_move, cfg_verbose, cfg_force, cfg_hook, cfg_gate;
-
-/* The game checks a single byte before it will even ask for movement input, and
- * in keyboard-and-mouse mode that byte is zero. Writing it every frame loses:
- * a live test showed the engine resetting it before the movement code ran, every
- * frame without exception. So we NOP the branches that read it instead. */
-#define MAX_GATES 8
-static volatile uint8_t *g_padflag;
-static bg3_patch g_gates[MAX_GATES];
-static size_t g_ngates;
-
-/* Counts calls to the game's movement-input fetch. If this stays at zero while
- * keys are held, the game simply never asks for movement input in this mode —
- * which no amount of writing to the state block could fix. */
-static bg3_hook g_hook;
-static int g_hooked;
-
-/* A gate on the same state block, checked by another caller of the input fetch:
- *   cmp dword [block+0xe98], 0 ; je <skip the call>                          */
-#define GATE_OFF 0xe98
-
-static int g_is_bg3;
-static bg3_move_sig g_sig;
-static int g_have_sig;
-static bg3_move_ctl g_ctl;
-static int g_have_ctl;
-
-/* Live ECS type indices, read through the symbol table. They are zero until the
- * engine registers its component types, which makes them a reliable "is the game
- * actually up?" signal — and a gate on writing anything. */
-static const volatile uint32_t *g_ti_character;
-static const volatile uint32_t *g_ti_movement;
-
-static unsigned long g_frames;
-static int g_announced_live;
-
-/* Held state of the movement keys, maintained even when we swallow the events. */
-static struct { int w, a, s, d; } held;
-
-static int envflag(const char *k, int dflt)
-{
-    const char *v = getenv(k);
-    return v ? (*v != '0') : dflt;
-}
+static int cfg_verbose;   /* log from non-game processes too */
+static int cfg_trace;     /* per-keystroke and heartbeat detail */
 
 __attribute__((format(printf, 1, 2)))
 static void lg(const char *fmt, ...)
@@ -108,11 +78,72 @@ static void lg(const char *fmt, ...)
     }
 }
 
+#define trace(...) do { if (cfg_trace) lg(__VA_ARGS__); } while (0)
+
+/* ----------------------------------------------------------- configuration */
+
+static int cfg_suppress, cfg_move, cfg_force, cfg_hook, cfg_gate;
+static double cfg_walk_speed;
+static SDL_Scancode cfg_walk_key;
+
+static int envflag(const char *k, int dflt)
+{
+    const char *v = getenv(k);
+    return v ? (*v != '0') : dflt;
+}
+
+/* A small name table beats dlsym'ing SDL_GetScancodeFromName for the handful of
+ * keys anyone actually binds a walk modifier to. */
+static SDL_Scancode scancode_by_name(const char *name, SDL_Scancode dflt)
+{
+    static const struct { const char *name; SDL_Scancode sc; } tbl[] = {
+        {"lshift", SDL_SCANCODE_LSHIFT}, {"rshift", SDL_SCANCODE_RSHIFT},
+        {"lctrl",  SDL_SCANCODE_LCTRL},  {"rctrl",  SDL_SCANCODE_RCTRL},
+        {"lalt",   SDL_SCANCODE_LALT},   {"ralt",   SDL_SCANCODE_RALT},
+        {"capslock", SDL_SCANCODE_CAPSLOCK}, {"tab", SDL_SCANCODE_TAB},
+        {"none",   SDL_SCANCODE_UNKNOWN},
+    };
+    if (!name) return dflt;
+    for (size_t i = 0; i < sizeof tbl / sizeof *tbl; i++)
+        if (!strcasecmp(name, tbl[i].name)) return tbl[i].sc;
+    return dflt;
+}
+
+/* ------------------------------------------------------------- game state */
+
+static int g_is_bg3;
+static bg3_move_sig g_sig;
+static int g_have_sig;
+static bg3_move_ctl g_ctl;
+static int g_have_ctl;
+
+static volatile uint8_t *g_padflag;
+static bg3_patch g_gates[MAX_GATES];
+static size_t g_ngates;
+
+static bg3_hook g_hook;
+static int g_hooked;
+
+/* Live ECS type indices, read through the symbol table. Zero until the engine
+ * registers its component types, which makes them an "is the game up?" signal
+ * and a gate on writing anything. */
+static const volatile uint32_t *g_ti_character;
+static const volatile uint32_t *g_ti_movement;
+
+static unsigned long g_frames;
+static int g_announced_live;
+
+/* Held state of the movement keys, maintained even when we hide the events. */
+static struct { int w, a, s, d, walk; } held;
+
+/* True while the game has a text field focused, e.g. naming a save. Typing
+ * "was" into a save name must not walk your character across the room. */
+static int g_text_input;
+
+/* --------------------------------------------------------- identification */
+
 struct exec_range { const uint8_t *code; size_t len; uintptr_t va; };
 
-/* The first object dl_iterate_phdr reports is the main executable. We want its
- * executable PT_LOAD, live in memory — scanning that rather than the file means
- * the addresses we recover are already bias-adjusted. */
 static int exec_range_cb(struct dl_phdr_info *info, size_t sz, void *data)
 {
     (void)sz;
@@ -125,14 +156,34 @@ static int exec_range_cb(struct dl_phdr_info *info, size_t sz, void *data)
             r->len = p->p_memsz;
         }
     }
-    return 1;
+    return 1;   /* the first object is the main executable */
 }
 
-/* The signature scan is the identifying test, and deliberately the only one:
- * it reads mapped memory and cannot fail for environmental reasons. Reading the
- * symbol table needs /proc/self/exe and a readable game file, which may not hold
- * inside Steam's container — so symbols are a bonus, never a gate. An earlier
- * version required both, and a symbol-table failure silently disabled everything. */
+static void patch_gates(const struct exec_range *r, uintptr_t fetch)
+{
+    uintptr_t gates[MAX_GATES];
+    size_t ng = bg3_find_move_gates(r->code, r->len, r->va, fetch,
+                                    (uintptr_t)g_padflag, gates, MAX_GATES);
+    if (!ng) {
+        lg("no controller-mode gate found — movement will stay dormant");
+        return;
+    }
+    for (size_t i = 0; i < ng; i++) {
+        uint8_t expect[6];
+        memcpy(expect, (const void *)gates[i], 6);
+        if (expect[0] != 0x0F || expect[1] != 0x84)
+            continue;
+        int rc = bg3_patch_nop(gates[i], 6, expect, &g_gates[g_ngates]);
+        if (rc == BG3_HOOK_OK) g_ngates++;
+        else lg("gate @%#lx NOT patched (rc=%d)", gates[i], rc);
+    }
+    lg("opened %zu of %zu movement gate(s)", g_ngates, ng);
+}
+
+/* The signature scan is the identifying test, and deliberately the only one: it
+ * reads mapped memory and cannot fail for environmental reasons. Reading the
+ * symbol table needs /proc/self/exe and a readable game file, neither guaranteed
+ * inside Steam's container, so symbols are a bonus and never a gate. */
 static void identify_host(void)
 {
     struct exec_range r = {0};
@@ -141,113 +192,122 @@ static void identify_host(void)
 
     g_have_sig = (rc == 1);
     g_is_bg3 = g_have_sig;
-
     if (!g_is_bg3) {
         if (cfg_verbose)
             lg("not the game (%zu KB of code, signature rc=%d) — idle", r.len / 1024, rc);
         else
-            g_logf = NULL;   /* stay out of the log entirely */
+            g_logf = NULL;   /* Steam re-execs through many helpers; stay silent */
         return;
     }
 
-    lg("BG3 identified by signature @%#lx", g_sig.match_va);
-    lg("state ptr @%#lx, vec +%#x, flag +%#x",
-       g_sig.global_slot, g_sig.vec_off, g_sig.flag_off);
+    lg("bg3le " BG3LE_VERSION " — BG3 identified, override @%#lx", g_sig.match_va);
 
     uintptr_t fetch = g_sig.match_va - 10;
     g_padflag = (volatile uint8_t *)bg3_find_padmode_flag(r.code, r.len, r.va, fetch);
-    if (!g_padflag) {
+    if (!g_padflag)
         lg("controller-mode flag NOT found — movement will stay dormant");
-    } else if (cfg_gate) {
-        uintptr_t gates[MAX_GATES];
-        size_t ng = bg3_find_move_gates(r.code, r.len, r.va, fetch,
-                                        (uintptr_t)g_padflag, gates, MAX_GATES);
-        lg("controller-mode flag @%p (currently %u); %zu gate branch(es)",
-           (void *)g_padflag, *g_padflag, ng);
-        static const uint8_t je6[2] = {0x0F, 0x84};
-        for (size_t i = 0; i < ng; i++) {
-            uint8_t expect[6];
-            memcpy(expect, (const void *)gates[i], 6);
-            if (memcmp(expect, je6, 2) != 0) continue;
-            int rc3 = bg3_patch_nop(gates[i], 6, expect, &g_gates[g_ngates]);
-            lg("gate @%#lx: %s (rc=%d)", gates[i],
-               rc3 == BG3_HOOK_OK ? "NOPed" : "NOT patched", rc3);
-            if (rc3 == BG3_HOOK_OK) g_ngates++;
-        }
-    }
+    else if (cfg_gate)
+        patch_gates(&r, fetch);
 
     if (cfg_hook) {
-        /* The prologue starts 10 bytes before the signature match. We verify the
-         * bytes before patching, so a wrong guess refuses rather than corrupts. */
+        /* The prologue starts 10 bytes before the signature match. The bytes are
+         * verified before patching, so a wrong guess refuses rather than corrupts. */
         static const uint8_t prologue[5] = {0x55, 0x41, 0x57, 0x41, 0x56};
-        uintptr_t fn = g_sig.match_va - 10;
-        int rc2 = bg3_hook_count_calls(fn, prologue, &g_hook);
+        int rc2 = bg3_hook_count_calls(fetch, prologue, &g_hook);
         g_hooked = (rc2 == BG3_HOOK_OK);
-        lg("call counter on GetMoveInput @%#lx: %s (rc=%d)", fn,
-           g_hooked ? "installed" : "NOT installed", rc2);
+        if (!g_hooked) lg("call counter not installed (rc=%d)", rc2);
     }
 
-    /* Best effort from here on. Resolve the ECS probes now but read them later:
-     * at constructor time the engine has not registered its types yet, so every
-     * index is still zero and tells us nothing. */
     char err[256] = {0};
     sr_ctx *c = sr_open_self(err, sizeof err);
     if (!c) {
         lg("symbols unavailable (%s) — continuing without the engine-ready gate", err);
         return;
     }
-    lg("symbols: %zu, load bias %#lx", sr_count(c), sr_bias(c));
-
     sr_req probe[] = {
         {"_ZN2ls6TypeIdIN3ecl9CharacterEN3ecs22ComponentTypeIdContextEE11m_TypeIndexE", 0, 0},
         {"_ZN2ls6TypeIdIN3eoc17MovementComponentEN3ecs22ComponentTypeIdContextEE11m_TypeIndexE", 0, 0},
     };
-    if (sr_resolve_many(c, probe, 2) == 0) {
+    if (sr_resolve_many(c, probe, 2) == 0)
         lg("ECS probe symbols not found — continuing without the engine-ready gate");
-    } else {
+    else {
         g_ti_character = (const volatile uint32_t *)probe[0].addr;
         g_ti_movement = (const volatile uint32_t *)probe[1].addr;
-        lg("ECS probes @%#lx and @%#lx",
-           (unsigned long)probe[0].addr, (unsigned long)probe[1].addr);
     }
     sr_close(c);
 }
 
 static int have_probes(void) { return g_ti_character || g_ti_movement; }
 
-/* True once the engine has registered its component types. Without probes we
- * cannot tell, so we say yes and rely on the state-block pointer instead. */
 static int engine_ready(void)
 {
-    if (!have_probes()) return 1;
+    if (!have_probes()) return 1;   /* cannot tell; rely on the block pointer */
     return (g_ti_character && *g_ti_character) || (g_ti_movement && *g_ti_movement);
 }
 
-/* Hand the game a movement vector directly, instead of letting it poll the four
- * CharacterMove* input actions. The engine treats this exactly like analog stick
- * deflection: it applies its own deadzone, normalises, clamps, and rotates the
- * vector into world space using the live camera. So what we write is
- * camera-relative — which is precisely what WASD means — and the character walks
- * through the ordinary locomotion, animation and collision path. */
+/* -------------------------------------------------------------- movement */
+
+static void release_movement(const char *why)
+{
+    int had = held.w || held.a || held.s || held.d;
+    memset(&held, 0, sizeof held);
+    if (g_have_ctl && *g_ctl.flag)
+        *g_ctl.flag = 0;
+    if (had)
+        trace("movement released (%s)", why);
+}
+
+/* Hand the game a movement vector instead of letting it poll the four
+ * CharacterMove* actions. The engine applies its own deadzone, normalise, clamp
+ * and camera rotation, so this is camera-relative — "forward" means away from
+ * the camera, which is exactly what WASD should mean. */
+static void drive_movement(void)
+{
+    if (!cfg_move || !g_have_ctl) return;
+    if (!engine_ready() && !cfg_force) return;
+
+    /* Y is positive-forward. SDL's stick convention is the opposite and
+     * following it sent the character backwards, so this axis is not SDL-signed. */
+    int x = held.d - held.a, y = held.w - held.s;
+
+    if (!x && !y) {
+        /* Leaving the flag set with a stale vector walks the character forever. */
+        if (*g_ctl.flag) {
+            *g_ctl.flag = 0;
+            trace("movement released (frame %lu)", g_frames);
+        }
+        return;
+    }
+
+    /* Magnitudes below 1.0 survive the engine's normalise step untouched, so a
+     * shorter vector really is a slower walk rather than a clamped run. */
+    double mag = held.walk ? cfg_walk_speed : 1.0;
+    if (x && y) mag *= 0.70710678;   /* a diagonal must not outrun a cardinal */
+
+    g_ctl.vec[0] = (float)(x * mag);
+    g_ctl.vec[1] = (float)(y * mag);
+    if (!*g_ctl.flag)
+        trace("movement engaged (frame %lu) vec=(%.3f, %.3f)%s", g_frames,
+              (double)g_ctl.vec[0], (double)g_ctl.vec[1], held.walk ? " walking" : "");
+    *g_ctl.flag = 1;
+}
+
 static void tick(void)
 {
     if (!g_is_bg3) return;
     g_frames++;
 
-    /* Re-resolve every frame rather than caching: if the game ever reallocates
-     * this block we would otherwise spend the rest of the session writing into
-     * freed memory and wondering why nothing moved. */
+    /* Re-resolve rather than cache: if the game ever reallocates this block we
+     * would otherwise spend the session writing into freed memory. */
     if (g_have_sig) {
         bg3_move_ctl now;
         if (bg3_move_ctl_resolve(&g_sig, &now)) {
             if (!g_have_ctl) {
                 g_have_ctl = 1;
                 g_ctl = now;
-                lg("state block resolved on frame %lu: block %#lx, flag currently %u",
-                   g_frames, now.block, *now.flag);
+                lg("movement control live (frame %lu)", g_frames);
             } else if (now.block != g_ctl.block) {
-                lg("state block MOVED on frame %lu: %#lx -> %#lx",
-                   g_frames, g_ctl.block, now.block);
+                lg("state block moved: %#lx -> %#lx", g_ctl.block, now.block);
                 g_ctl = now;
             }
         } else if (g_have_ctl) {
@@ -258,74 +318,66 @@ static void tick(void)
 
     if (!g_announced_live && have_probes() && engine_ready()) {
         g_announced_live = 1;
-        lg("engine initialised on frame %lu — ECS indices: Character=%u Movement=%u",
-           g_frames, g_ti_character ? *g_ti_character : 0,
-           g_ti_movement ? *g_ti_movement : 0);
+        lg("engine up (frame %lu) — ready", g_frames);
     }
 
-    if (g_frames % HEARTBEAT_FRAMES == 0) {
-        unsigned gate = g_have_ctl ? *(volatile uint32_t *)(g_ctl.block + GATE_OFF) : 0;
-        lg("frame %lu: block=%s pad=%u e98=%u calls=%llu readback vec=(%.2f,%.2f) flag=%u keys(w%d a%d s%d d%d)",
+    if (cfg_trace && g_frames % HEARTBEAT_FRAMES == 0)
+        lg("frame %lu: block=%s calls=%llu keys(w%d a%d s%d d%d walk%d) text=%d",
            g_frames, g_have_ctl ? "live" : "null",
-           g_padflag ? *g_padflag : 0, gate,
            g_hooked ? (unsigned long long)*g_hook.counter : 0ULL,
-           g_have_ctl ? (double)g_ctl.vec[0] : 0.0,
-           g_have_ctl ? (double)g_ctl.vec[1] : 0.0,
-           g_have_ctl ? *g_ctl.flag : 0,
-           held.w, held.a, held.s, held.d);
-    }
+           held.w, held.a, held.s, held.d, held.walk, g_text_input);
 
-    if (!cfg_move || !g_have_ctl)
-        return;
-    /* Refuse to write into a game that has not finished starting up. */
-    if (!engine_ready() && !cfg_force)
-        return;
-
-    /* Y is positive-forward here. SDL's stick convention is the opposite
-     * (negative is up) and following it sent the character backwards, so this
-     * axis is deliberately not SDL-signed. */
-    int x = held.d - held.a, y = held.w - held.s;
-
-    if (!x && !y) {
-        /* Leaving the flag set with a stale vector walks the character forever. */
-        if (*g_ctl.flag) {
-            *g_ctl.flag = 0;
-            lg("movement released (frame %lu)", g_frames);
-        }
-        return;
-    }
-    /* Magnitude 1.0 in any direction; the engine's own clamp handles the rest. */
-    double mag = (x && y) ? 0.70710678 : 1.0;
-    g_ctl.vec[0] = (float)(x * mag);
-    g_ctl.vec[1] = (float)(y * mag);
-    if (!*g_ctl.flag)
-        lg("movement engaged (frame %lu) vec=(%.3f, %.3f)",
-           g_frames, (double)g_ctl.vec[0], (double)g_ctl.vec[1]);
-    *g_ctl.flag = 1;
+    drive_movement();
 }
+
+/* ----------------------------------------------------------- input filter */
 
 /* Returns 1 if the event should be hidden from the game. */
 static int intercept(const SDL_Event *ev)
 {
+    /* Alt-tabbing away with a key held would otherwise walk forever. */
+    if (ev->type == SDL_WINDOWEVENT &&
+        (ev->window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
+         ev->window.event == SDL_WINDOWEVENT_MINIMIZED)) {
+        release_movement("focus lost");
+        return 0;
+    }
+
     if (ev->type != SDL_KEYDOWN && ev->type != SDL_KEYUP)
         return 0;
+
+    /* While a text field is focused every key belongs to the game. */
+    if (g_text_input) {
+        if (held.w || held.a || held.s || held.d)
+            release_movement("text input");
+        return 0;
+    }
+
     if (ev->key.repeat)
-        return cfg_suppress && held.w + held.a + held.s + held.d > 0;
+        return cfg_suppress && (held.w || held.a || held.s || held.d);
 
     int down = (ev->type == SDL_KEYDOWN);
+    SDL_Scancode sc = ev->key.keysym.scancode;
+
+    /* The walk modifier is observed but never swallowed — it is a real binding
+     * in the game and stealing it would break whatever it is bound to. */
+    if (cfg_walk_key != SDL_SCANCODE_UNKNOWN && sc == cfg_walk_key) {
+        held.walk = down;
+        return 0;
+    }
+
     int *slot = NULL;
-    switch (ev->key.keysym.scancode) {
+    switch (sc) {
     case SDL_SCANCODE_W: slot = &held.w; break;
     case SDL_SCANCODE_A: slot = &held.a; break;
     case SDL_SCANCODE_S: slot = &held.s; break;
     case SDL_SCANCODE_D: slot = &held.d; break;
-    default: return 0;
+    default: return 0;   /* jump, interact and everything else pass through */
     }
     if (*slot != down) {
         *slot = down;
-        lg("key %s %s -> vector (%+d,%+d)",
-           SDL_GetScancodeName(ev->key.keysym.scancode), down ? "down" : "up",
-           held.d - held.a, held.w - held.s);
+        trace("key %s %s -> vector (%+d,%+d)", SDL_GetScancodeName(sc),
+              down ? "down" : "up", held.d - held.a, held.w - held.s);
     }
     return cfg_suppress;
 }
@@ -343,43 +395,41 @@ int SDL_PollEvent(SDL_Event *ev)
     for (;;) {
         int r = real_poll(ev);
         if (!r) {
-            /* The game drains events until this returns 0, so here we are exactly
-             * once per frame, on the main thread, before the frame is simulated. */
+            /* The game drains events until this returns 0, so we are here
+             * exactly once per frame, on the main thread, before simulation. */
             tick();
             return 0;
         }
         if (intercept(ev))
-            continue;  /* swallowed — hand the game the next event instead */
+            continue;   /* swallowed — hand the game the next event instead */
         return 1;
     }
 }
 
-/* Losing focus with keys held would otherwise leave the character walking. */
-__attribute__((destructor)) static void bg3le_fini(void)
+/* The game tells us when a text field takes focus; we only have to listen. */
+void SDL_StartTextInput(void)
 {
-    if (g_have_ctl && *g_ctl.flag) {
-        *g_ctl.flag = 0;
-        lg("cleared movement flag on unload");
-    }
-    for (size_t i = 0; i < g_ngates; i++)
-        bg3_patch_restore(&g_gates[i]);
-    if (g_ngates) lg("restored %zu gate branch(es)", g_ngates);
-    if (g_hooked) {
-        /* The game forks after init, so a child's destructor sees a
-         * copy-on-write island frozen at zero. Trust the heartbeat, not this. */
-        lg("GetMoveInput count in this process: %llu (0 here just means a forked copy)",
-           (unsigned long long)*g_hook.counter);
-        bg3_hook_remove(&g_hook);
-    }
+    static void (*real_start)(void);
+    if (!real_start) real_start = dlsym(RTLD_NEXT, "SDL_StartTextInput");
+    g_text_input = 1;
+    release_movement("text input started");
+    if (real_start) real_start();
 }
 
-/* Steam's container runtime may not give us a writable $HOME, and if the log
- * cannot be opened we would vanish without trace. Fall back through candidates,
- * and mirror to stderr so something survives even when every file fails. */
+void SDL_StopTextInput(void)
+{
+    static void (*real_stop)(void);
+    if (!real_stop) real_stop = dlsym(RTLD_NEXT, "SDL_StopTextInput");
+    g_text_input = 0;
+    if (real_stop) real_stop();
+}
+
+/* ------------------------------------------------------------- lifecycle */
+
 static void open_log(void)
 {
     const char *want = getenv("BG3LE_LOG");
-    const char *tries[3];
+    const char *tries[2];
     int n = 0;
     if (want) tries[n++] = want;
     tries[n++] = "/tmp/bg3le.log";
@@ -395,23 +445,40 @@ static void open_log(void)
         }
     }
     g_logf = stderr;
-    g_mirror_stderr = 0;   /* already stderr; do not double up */
     fprintf(stderr, "bg3le: no writable log file, logging to stderr\n");
+}
+
+__attribute__((destructor)) static void bg3le_fini(void)
+{
+    if (g_have_ctl && *g_ctl.flag) *g_ctl.flag = 0;
+    for (size_t i = 0; i < g_ngates; i++)
+        bg3_patch_restore(&g_gates[i]);
+    if (g_ngates) lg("restored %zu gate branch(es)", g_ngates);
+    if (g_hooked) bg3_hook_remove(&g_hook);
 }
 
 __attribute__((constructor)) static void bg3le_init(void)
 {
     open_log();
+    cfg_verbose = envflag("BG3LE_VERBOSE", 0);
+    cfg_trace = envflag("BG3LE_TRACE", 0);
     cfg_suppress = envflag("BG3LE_SUPPRESS", 1);
     cfg_move = envflag("BG3LE_MOVE", 1);
-    cfg_verbose = envflag("BG3LE_VERBOSE", 0);
     cfg_force = envflag("BG3LE_FORCE", 0);
-    cfg_hook = envflag("BG3LE_HOOK", 1);
+    cfg_hook = envflag("BG3LE_HOOK", cfg_trace);   /* only needed for diagnostics */
     cfg_gate = envflag("BG3LE_GATE", 1);
+    cfg_walk_key = scancode_by_name(getenv("BG3LE_WALK_KEY"), SDL_SCANCODE_LSHIFT);
+    {
+        const char *v = getenv("BG3LE_WALK_SPEED");
+        cfg_walk_speed = v ? atof(v) : 0.5;
+        if (cfg_walk_speed <= 0.0 || cfg_walk_speed > 1.0) cfg_walk_speed = 0.5;
+    }
     if (cfg_verbose && g_logf != stderr) g_mirror_stderr = 1;
 
     identify_host();
     if (g_is_bg3)
-        lg("armed (move=%d suppress=%d gate=%d hook=%d, %zu gates NOPed)",
-           cfg_move, cfg_suppress, cfg_gate, cfg_hook, g_ngates);
+        lg("ready (move=%d suppress=%d gates=%zu walk=%s@%.2f)",
+           cfg_move, cfg_suppress, g_ngates,
+           cfg_walk_key == SDL_SCANCODE_UNKNOWN ? "off" : SDL_GetScancodeName(cfg_walk_key),
+           cfg_walk_speed);
 }

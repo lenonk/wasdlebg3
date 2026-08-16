@@ -8,9 +8,11 @@ Drive the game's **own analog-stick movement path** through a forced-input overr
 exists in the binary, from an `LD_PRELOAD` library that piggybacks on `SDL_PollEvent` for its
 per-frame heartbeat.
 
-**Version 1 requires no inline hooking, no code patching and no ECS surgery.** It is two memory
-writes per frame into a global the game reads anyway. That is a dramatically smaller blast radius
-than the Windows Script Extender's approach, and it exists because of a lucky find described below.
+It is two memory writes per frame into a global the game reads anyway, plus **six bytes of code
+patched in memory** to stop the game skipping that read outside controller mode. That last part was
+not in the original plan — see [the critical unknown](#the-critical-unknown--resolved) — but the
+blast radius is still far smaller than the Windows Script Extender's approach, and no ECS surgery
+is involved at all.
 
 ## The mechanism
 
@@ -82,30 +84,37 @@ session limit, so the distinction matters.
 `LocomotionComponent`'s 132-byte layout; `eocnet::CharacterSteeringMessage` id `0x24`; the camera
 component layout and `GameCameraBehavior` direction vectors at `+0x70`/`+0x7c`; the input-mode
 arbiter at `0x500c4f0` with `ActivateControllerMode` `0x500bec0` / `EnsureKBM` `0x500c270`; the
-controller-mode suppression bytes at `[*(base+0x7D5C040)]+0x221/+0x222`; and the claim that the
-game `fork()`s at `main+0x32f` and runs as a child under a `waitpid` supervisor.
+controller-mode suppression bytes at `[*(base+0x7D5C040)]+0x221/+0x222`.
 
-That last one matters operationally: if true, our library is loaded into both processes and the
-one doing the work is the child. Verify it before spending time debugging a "nothing happened" run.
+**Since confirmed by observation:** the game does `fork()` after initialisation. A child's
+destructor reads a copy-on-write trampoline island frozen at its pre-fork value, which is exactly
+why the exit-time call counter reported zero in two live logs while the per-frame heartbeat in the
+same session reported tens of thousands.
 
-## The critical unknown
+## The critical unknown — resolved
 
-**Is `MoveController::update` ticked while the game is in keyboard-and-mouse mode?**
+The question was whether the movement path runs at all in keyboard-and-mouse mode. It does
+not, and the answer came from measurement rather than analysis.
 
-If it is, v1 works as written and the UI never changes. If it is not — if `MoveController` only
-runs once the game has entered controller mode — then we must additionally force that tick, and
-the honest fallback is the controller-mode path, which carries a real cost: switching modes
-triggers a wholesale Noesis UI reload (`Theme/DefaultTheme_c.xaml` versus `Theme/DefaultTheme.xaml`),
-so a naive virtual gamepad plus a real mouse produces constant UI thrash between pad and KBM themes.
-The reported escape hatch is pinning the mode via the two config bytes above.
+A call counter installed on the input fetch recorded **zero calls across 11,500 frames**.
+The game never asks for movement input outside controller mode, so no amount of writing to
+the forced-input block could matter. Every caller is guarded by
 
-This cannot be settled by static analysis. It needs the game installed and a 30-minute experiment,
-which is the first thing to do once we have a real install.
+```
+0x0290a3db  cmp byte [rip + 0x5492d26], 0   ; -> 0x7d9d108, controller-mode flag
+0x0290a3e2  je  0x290a64d                    ; zero -> bail out before GetMoveInput
+```
 
-Note this is precisely where our approach diverges favourably from the Windows prior art.
-`Ch4nKyy/BG3WASD` gets WASD by remapping keybinds onto the `CharacterMove*` commands and then
-NOP-ing a controller-mode gate. Our override sits *downstream* of the action polling, so if
-`MoveController` ticks in KBM mode we bypass the gate entirely rather than defeating it.
+Setting that flag was tried first and lost outright: with the mod writing 1 every frame, it
+read back as 0 at every heartbeat without exception. The engine's input-mode arbiter resets
+it faster than a per-frame write can hold it.
+
+So the six-byte `je` is NOPed instead, as one aligned atomic store. With the branch gone the
+counter went from 0 to 15,497 calls in a live session and the character moves. This is the
+same gate `Ch4nKyy/BG3WASD` defeats on Windows, reached independently from our own
+measurements. The UI never switches theme, because we never enter controller mode — we only
+stop the game checking whether it is in one.
+
 
 ## Patch resilience
 
@@ -141,18 +150,26 @@ not v1 itself, which only needs the signature scan.
 - **Stuck movement.** If the flag is left set with a stale vector the character walks forever.
   Clear it whenever no key is held, and on focus loss.
 
-## Staged plan
+## Status
 
-1. **The `.so` loads and logs.** Already done and tested — see below.
-2. **Read-only proof of life.** With the game installed, run the signature scan and log the derived
-   global, then log the live movement vector while the user moves with a real controller or mouse.
-   No writes. This confirms every address in one shot.
-3. **Move the character.** Enable the two writes. This is the milestone.
-4. **Settle the KBM question**, and if needed add mode pinning.
-5. Polish: run/walk modifier, focus handling, config file, jump/interact passthrough.
-6. Only then consider ECS access, which is where the `ls::TypeId<…>::m_TypeIndex` statics
-   (2,107 components, 934 systems, resolvable **by name**) become the foundation for a general
-   extender rather than a movement mod.
+Shipping as 0.1.0 and verified live on 4.1.1.7398727: the library loads, identifies its
+host, derives every address, opens the gate and moves the character, with a walk modifier,
+focus handling and text-input awareness.
+
+What remains is optional and unstarted:
+
+- **Mouse-look / over-the-shoulder camera.** The camera analysis exists but the
+  implementation does not touch it.
+- **ECS access.** The `ls::TypeId<...>::m_TypeIndex` statics — 2,107 components and 934
+  systems, resolvable **by name** — are the foundation for a general extender rather than a
+  movement mod. Nothing needs them yet.
+- **Multiplayer.** Out of scope; see the risks.
+
+One loose end worth recording: the game **forks after initialisation**. A child's destructor
+reads a copy-on-write trampoline island frozen at its pre-fork value, which is why an
+exit-time call count reports zero while the per-frame heartbeat reports tens of thousands.
+Harmless, but it will mislead anyone reading the exit line without knowing.
+
 
 ## What already works
 
