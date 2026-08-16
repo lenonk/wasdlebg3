@@ -1,0 +1,9 @@
+# Never commit the game binary or anything derived from it.
+# bg3.db and symtab.raw.txt contain symbol names extracted from Larian's
+# copyrighted executable — they are working notes, not redistributable.
+analysis/bg3.db
+analysis/*.raw.txt
+analysis/*.log
+analysis/ghidra_proj/
+*.so
+build/

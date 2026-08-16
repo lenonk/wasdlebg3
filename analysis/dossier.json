@@ -1,0 +1,790 @@
+[
+ {
+  "dimension": "priorart",
+  "summary": "Norbyte's BG3 Script Extender is a Windows-only DWrite.dll proxy that downloads a per-game-version DLL and bootstraps from 69 byte-pattern mappings in BinaryMappings.xml resolving 99 game symbols, using Microsoft Detours for hooks; Norbyte states directly (bg3se issue #539, 2025-11-13) that those MSVC patterns will not match the Linux binary because it is built with a different compiler, and there is no Linux port \u2014 issue #530 has sat open since the native build shipped. The WASD movement mod (Ch4nKyy/BG3WASD, open source) does NOT synthesise mouse clicks: it copies the CameraForward/Backward/Left/Right keybinds onto the CharacterMoveForward/Backward/Left/Right commands in inputremap_pN.json and then NOPs one controller-mode gate so the game's own analog-controller movement path accepts keyboard input \u2014 a data file plus one code patch. I verified this technique's anchors survive verbatim into our Linux ELF: CharacterMoveForward is still command 0x9d/157, and I located GetInputValue at 0x2d1d880 (58 call sites), the movement-vector reader at 0x2c75cd0 reading 0xa0/0x9f/0x9d/0x9e, HandleCameraInput at 0x2c82bf0 reading 0x66/0x65/0x64, and the sole SDL_PollEvent call site at 0x02e9e7c8. The only public native-Linux BG3 code mod is ahungry/bg3-linux-ae, a 299-line LD_PRELOAD .so doing mprotect+memcpy byte patches found by scanning /proc/self/maps \u2014 and all four of its historical byte patterns score ZERO hits in our binary (4.1.1.7398727), which is the strongest available argument for our symbol/reloc approach over pattern scanning. The closest architectural prior art is tdimino/bg3se-macos, a ground-up non-Windows SE rebuild whose PORTING.md says explicitly that having a symbol table makes re-porting \"run a script and paste the output\" instead of a multi-hour RE session.",
+  "key_addresses": [
+   {
+    "addr": "0x2d1d880",
+    "what": "GetInputValue(playerController, commandId, playerIdx) \u2014 the central input-read primitive that every BG3WASD hook targets on Windows",
+    "evidence": "numpy scan of .text for e8 rel32 targeting it: 'call sites to 0x2d1d880: 58'. Called with esi=0x9d/0x9e/0x9f/0xa0 (movement) at 0x2c75ce4/cf8/d0c/d20 and with esi=0x66/0x65/0x64 (camera) at 0x2c82c05/c1d/c35. Matches BG3WASD doc/guide.md: 'These variables are then passed to a function I name GetInputValue. All 4 calls of this function are hooked by the mod!'"
+   },
+   {
+    "addr": "0x2c75cd0",
+    "what": "GetMovementInputVec / GetMovementInputWorldVec equivalent \u2014 reads all four movement axes and combines them into a vector",
+    "evidence": "bg3q.py dis 0x2c75cd0: 'mov esi, 0xa0; call 0x2d1d880' then 0x9f, then 0x9d, then 0x9e, results merged via 'insertps xmm0, dword ptr [rsp + 0x14], 0xc' at 0x2c75d2a. This is the exact structure the Windows guide describes."
+   },
+   {
+    "addr": "0x2c82bf0",
+    "what": "HandleCameraInput equivalent \u2014 the function BG3WASD's BlockCameraInputCavehook patches to stop the camera consuming WASD",
+    "evidence": "bg3q.py dis 0x2c82bf0: 'mov esi, 0x66 / call 0x2d1d880', 'mov esi, 0x65 / call', 'mov esi, 0x64 / call' = CameraRight/Left/Backward (102/101/100), matching guide.md 'GetInputValue is called 4 times next to each other with the command ids 99, 100, 101, 102'"
+   },
+   {
+    "addr": "0x04146530",
+    "what": "Input command registration table \u2014 proves the Windows command IDs carry over unchanged to Linux",
+    "evidence": "bg3q.py dis 0x04146530: 'mov dword ptr [r14], 0x9d' immediately before 'lea rax, [rip - 0x26bd910] ; str CharacterMoveForward'; next block 'mov dword ptr [r14], 0x9e' before str 'CharacterMoveBackward'. BG3WASD guide.md predicted 'Should be 157, if it doesn't change. This is 0x9D'. Registration sites are 0x7e apart: 0x04146560/0x041465de/0x0414665c/0x041466da for Forward/Backward/Left/Right."
+   },
+   {
+    "addr": "0x02e9e7c8",
+    "what": "The single SDL_PollEvent call site = the game's PollInput function; the interception point bg3se and BG3WASD both use",
+    "evidence": "sqlite3 'select count(*) from xrefs join symbols on dst=id where name=SDL_PollEvent' -> 1, site 0x02e9e7c8, rtype 4 (R_X86_64_PLT32). SDL_GetWindowGrab is called at 0x02e9f06f and 0x02e9f9e7 in the same region \u2014 BG3WASD guide.md: 'In the PollInput function, also SDL_GetWindowGrab is called twice.'"
+   },
+   {
+    "addr": "0x03b3b1f4",
+    "what": "LoadInputConfig \u2014 the function that reads the keybind JSON that BG3WASD rewrites to implement movement",
+    "evidence": "bg3q.py str inputremap -> 0x01b0efae 'inputremap_p1.json' used at 0x03b3b1f4 (also p2/p3/p4 at 0x03b3b229/0x03b3b261/0x03b3b299). guide.md: 'Search for the string inputremap_p1.json. It should only have one xref and that is inside the function I name LoadInputConfig.'"
+   },
+   {
+    "addr": "0x0290a850",
+    "what": "Second movement-input reader with a cmove-selected alternate command set (0x9d/0x9e/0x9f vs 0x68/0x69/0x6c)",
+    "evidence": "bg3q.py dis 0x290a850: 'mov r15d,0x9f / mov r12d,0x9d / mov r13d,0x9e' then 'mov eax,0x6c / cmove r15d,eax', 'mov eax,0x68 / cmove r12d,eax', 'mov eax,0x69 / cmove r13d,eax', all feeding call 0x2d1d880. Suggests a mode switch (likely controller vs keyboard) selecting which command IDs are read."
+   },
+   {
+    "addr": "0x05a41fda",
+    "what": "Inside ecl::EocClient::HandleError \u2014 recovers the MANGLED NAME of an anonymous Larian function, and is one of bg3se's 99 required anchors (ecl__EoCClient__HandleError)",
+    "evidence": "sqlite3 shows symbol '.L__FUNCTION__._ZN3ecl9EocClient11HandleErrorERKN2ls16TranslatedStringEbS4_N3eoc18EMessageBoxLocalIdE'; bg3q.py to <that symbol> -> '[1 references] 0x05a41fda'. There are 206 .L__FUNCTION__ and 11,375 .L__PRETTY_FUNCTION__ statics; 47 .L__FUNCTION__ are ecl/esv/eoc-scoped. This is a naming channel Norbyte does not have on Windows."
+   },
+   {
+    "addr": "0x040905cd",
+    "what": "Use site of the FixedString GUID d65cf1b6-... = bg3se's ls::ModuleSettings::IsModded anchor (achievement gate)",
+    "evidence": "bg3q.py str d65cf1b6 -> 0x01a5631f 'd65cf1b6-23a8-f0db-0a56-4b479a559748' used at 0x040905cd. Norbyte's BinaryMappings.xml uses this same GUID as the Condition for the IsModded mapping; ahungry (issue #539) could not find its xref in Ghidra \u2014 we get it by reloc for free."
+   },
+   {
+    "addr": "0x0320c4db",
+    "what": "Use site of 'LoadWarnings' \u2014 ahungry's stated navigation anchor for finding the modded-save warning path on Linux",
+    "evidence": "bg3q.py str LoadWarnings -> 0x01932514 used at 0x0320c4db (single site). ahungry, bg3se issue #539: 'eventually hit a function with some wonderful string literals like LoadWarnings - on the linux binary there is only a single LoadWarnings string'. He spent ~20 hours; we resolve it in one query."
+   },
+   {
+    "addr": "0x0199b5bb",
+    "what": "Game build string 4.1.1.7398727 \u2014 identifies our binary's exact version for cross-referencing prior art",
+    "evidence": "bg3q.py str '^4\\.[0-9]+\\.[0-9]+\\.[0-9]+$' -> single hit '4.1.1.7398727', used at 6 sites. Corroborated by bg3se-macos docs/PORTING.md, which names 7398727 as a supported build ('BinkManager::LoadVideo ... stayed at 0x10390b6cc through 7209685 and moved to 0x103916380 in 7398727') \u2014 i.e. the macOS SE targets the same game version as our Linux ELF."
+   }
+  ],
+  "hook_points": [
+   {
+    "where": "LD_PRELOAD .so interposing SDL_PollEvent (game's only call site: 0x02e9e7c8, R_X86_64_PLT32 against libSDL2.so)",
+    "how": "Exactly bg3se's SDLManager design, ported: keep a queue of synthetic SDL_Events; on each SDL_PollEvent, drain the queue first, else call the real one via dlsym(RTLD_NEXT) and post-process. bg3se's BG3Extender/Extender/Client/SDL.cpp SDLPollEventHooked returns injected events before ever calling the wrapped function \u2014 that is a pure userspace queue, no SDL_PushEvent needed, which matters because the game does NOT import SDL_PushEvent. On Linux this needs zero code patching: the game resolves SDL_PollEvent through the PLT and our preloaded .so wins symbol lookup order.",
+    "risk": "The game may cache the function pointer (it does not appear to \u2014 single PLT-relative call site). SDL2 built with SDL_DYNAMIC_API routes internal calls through a jump table, so interposing the exported symbol catches the game's calls but not SDL-internal ones (irrelevant here). Steam's own overlay also preloads; must chain LD_PRELOAD rather than overwrite it (ahungry's bg3-linux-ae.sh does exactly this: LD_PRELOAD=\"...${LD_PRELOAD:+:$LD_PRELOAD}\").",
+    "confidence": "high"
+   },
+   {
+    "where": "inputremap_p1.json on disk \u2014 no code at all",
+    "how": "BG3WASD's actual movement mechanism. src/InputconfigPatcher.cpp calls UpdateData(data, \"CharacterMoveForward\", \"CameraForward\", ...) for all four axes: it copies whatever keys are bound to CameraForward/Backward/Left/Right onto CharacterMoveForward/Backward/Left/Right. The engine already routes those four commands (IDs 157-160, confirmed 0x9d at 0x04146530 in OUR binary) into the analog-movement path. This is a data change to a JSON file the game reads at 0x03b3b1f4 \u2014 it survives every patch and needs no injection whatsoever.",
+    "risk": "Alone it does nothing: the game gates that path on a controller-mode flag, which is why BG3WASD also ships WASDUnlockPatch. Also BG3WASD had to hook LoadInputConfig/AfterChangingKeybindInMenu to re-apply the patch whenever the game rewrites the file from its keybind UI.",
+    "confidence": "high"
+   },
+   {
+    "where": "The controller-mode gate guarding the WASD movement path (Linux location NOT yet found)",
+    "how": "BG3WASD's WASDUnlockPatch NOPs a `cmp`/`jz` on a global byte the guide names IsInControllerMode, inside the predicate function called at the top of UpdateWasdMove. On Linux, start from the two movement readers I located (0x2c75cd0 and 0x0290a850) and walk callers; note 0x0290a850 already contains a cmove that switches between command-ID sets 0x9d/0x9e/0x9f and 0x68/0x69/0x6c, which is a mode branch and a strong lead. Native Camera Tweaks finds the same global by pattern '80 3D ?? ?? ?? ?? ?? 74 22' (cmp byte ptr [rip+X], imm8 / jz).",
+    "risk": "Not yet verified in our binary \u2014 this is the one load-bearing piece of the WASD design I could not confirm statically. clang's codegen may have folded the check differently than MSVC. A NOP patch also needs mprotect and is version-specific; prefer expressing it as a reloc-anchored offset rather than a byte pattern.",
+    "confidence": "low"
+   },
+   {
+    "where": "Call-site rewriting of `call rel32` at known relocation sites, e.g. the four GetInputValue calls at 0x2c75ce4 / 0x2c75cf8 / 0x2c75d0c / 0x2c75d20",
+    "how": "This is precisely what both BG3WASD and Native Camera Tweaks do \u2014 DKUtil's `dku::Hook::write_call<5>(callSiteAddress, MyFunc)` rewrites one 5-byte call instruction, NOT the function prologue (see NCT src/Hooks.h lines 185-259: eight separate write_call<5> installs). Their whole difficulty is *finding* those call-site addresses by pattern; we already have them as literal addresses. Add the PIE load bias from dl_iterate_phdr and patch. This gives per-call-site granularity \u2014 you can hook the movement read without disturbing the 54 other GetInputValue callers.",
+    "risk": "Requires mprotect(PROT_WRITE|PROT_EXEC) on a text page and must be done before/while the game is single-threaded, or with the target thread quiesced. Redirecting a call from a hot per-frame path costs a branch mispredict at worst. Each address is build-specific (ours is 4.1.1.7398727) \u2014 but so is every approach; the difference is ours regenerates by re-running the reloc query, not by re-doing RE.",
+    "confidence": "high"
+   },
+   {
+    "where": "Inline detour of GetInputValue itself at 0x2d1d880 using funchook / Dobby / frida-gum",
+    "how": "Single choke point for ALL input reads (58 call sites). Return a synthesised axis value for command IDs 157-160 when your WASD state says so, delegate to the original otherwise. funchook (kubo/funchook) supports Linux x86_64 and handles the trampoline/relocation of overwritten prologue instructions; frida-gum's Interceptor is the heavier but better-tested option; bg3se-macos chose Dobby for the same job on ARM64.",
+    "risk": "Prologue-splicing needs a correct instruction-length decoder and is riskier than call-site rewriting on a clang-optimised binary that may have jump targets inside the first 5 bytes. Also fires for all 58 callers including UI/menu paths, so your filter must be exact. Prefer call-site rewriting where you know the sites; reserve inline detours for functions with no enumerable call sites.",
+    "confidence": "medium"
+   },
+   {
+    "where": "Proxy or replace libSDL2.so wholesale (DT_NEEDED entry confirmed by readelf -d)",
+    "how": "The Linux analogue of what Windows Native Mod Loader does: it ships a replacement SDL2.dll (and bink2w64.dll) alongside the game. On Linux this is easier and reversible \u2014 either ship a shim libSDL2.so that dlopens the real one, or use SDL's own officially-supported SDL_DYNAMIC_API environment variable, which points SDL at a replacement library via SDL_DYNAPI_entry() filling a jump table (docs/README-dynapi.md, vendored in BG3WASD's own extern/SDL2).",
+    "risk": "SDL_DYNAMIC_API only works if the shipped libSDL2.so was built with dynapi enabled (default upstream, but I could NOT verify \u2014 we don't have the .so). Replacing the library file touches the game install, which Yet-Another-BG3-Native-Mod-Loader explicitly criticises as maintenance burden. LD_PRELOAD achieves the same interception without touching any game file.",
+    "confidence": "medium"
+   },
+   {
+    "where": "libOsiris.so exported symbols, for a scripting/event layer",
+    "how": "bg3se-macos hooks libOsiris.dylib because it 'exports clean C/C++ symbols we can hook' \u2014 1,013 symbols including _ZN7COsiris8InitGameEv, _ZN7COsiris4LoadER12COsiSmartBuf, _DebugHook, _CreateRule, _DefineFunction, _SetInitSection. libOsiris.so is a DT_NEEDED of our binary, so the Linux equivalents are almost certainly exported and directly interposable via LD_PRELOAD with no pattern scanning at all.",
+    "risk": "Unverified \u2014 we do not have libOsiris.so, only the DT_NEEDED entry. bg3se-macos also warns that when hooking C++ member functions 'the return value must be captured and returned from the hook. Failing to do so causes the game to fail silently.' Osiris is the story/quest layer, not the movement layer, so this is orthogonal to WASD.",
+    "confidence": "medium"
+   },
+   {
+    "where": "Vulkan implicit layer for any in-game overlay (ImGui-style debug UI)",
+    "how": "bg3se renders its console with ImGui via ImGui_ImplSDL2_InitForVulkan. On Linux, an implicit Vulkan layer (a JSON manifest in ~/.local/share/vulkan/implicit_layer.d) is the officially-sanctioned interception mechanism \u2014 this is how MangoHud and vkBasalt work, no patching involved.",
+    "risk": "Our binary imports zero vk* symbols (sqlite: 'select count(*) from symbols where name like vk%' -> 0), so Vulkan is reached indirectly, most likely via SDL_Vulkan_GetVkGetInstanceProcAddr or dlopen of libvulkan. A layer still intercepts correctly regardless, but you cannot hook a vk* PLT entry that does not exist. Input capture from an overlay must coordinate with whatever SDL_PollEvent filtering you install.",
+    "confidence": "medium"
+   },
+   {
+    "where": "Per-version address table generated from the reloc/symbol DB, instead of a pattern database",
+    "how": "Copy bg3se-macos's tools/port_offsets.py + offset_manifest.json model: record each needed address by SYMBOL plus its resolution method, and regenerate the table per build. Their PORTING.md states plainly: 'The macOS BG3 binary ships with its symbol table... So almost every address the extender needs can be found by name with nm, no Ghidra required. (Norbyte's Windows extender needs heavy pattern-scanning because the Windows binary is stripped.)' Our situation is the same but stronger, because --emit-relocs gives exact xrefs for the anonymous functions too.",
+    "risk": "Their doc names the real failure modes and they apply to us verbatim: 'ABI CHANGED \u2014 the symbol resolved, but its signature no longer matches the C wrapper that calls it... Address validity is not ABI validity'; 'AMBIGUOUS \u2014 the symbol matched more than one address'; and struct field offsets still require one-time Ghidra work and can silently break when Larian restructures a class.",
+    "confidence": "high"
+   }
+  ],
+  "negative_results": [
+   "There is NO Linux-native Script Extender and no maintainer intent to build one. bg3se issue #530 'SE & SteamDeck Native 9-23 Update' (opened 2025-09-23) is still open with no maintainer commitment; the substantive comments are from users, not Norbyte. Norbyte's own reply lives in issue #539 (2025-11-13): 'The Linux version is built with a different compiler (either GCC or LLVM) so the generated assembly will probably be very different... it is likely that the old patterns will not match code in the Linux binary.' The macOS PR #477 was closed unmerged.",
+   "bg3se's entire function-discovery layer does NOT carry over. BinaryMappings.xml is 69 <Mapping> blocks / 101 <Target> entries resolving 99 distinct symbols, all as MSVC x86-64 byte patterns with a single Version=\"4.47.63.76\" \u2014 e.g. '4c 8b 74 24 68 // mov r14, [rsp+48h+arg_18]' for ls__GlobalAllocator. Windows-calling-convention register allocation (rcx/rdx/r8/r9) is baked into every pattern; our binary is SysV (rdi/rsi/rdx/rcx). Zero of it is reusable. What IS reusable is the *target list* \u2014 those 99 symbol names are a validated inventory of what an extender actually needs to reach.",
+   "Byte-pattern scanning is empirically unreliable even on Linux. I searched our .text (vaddr 0x218be00, size 0x565c316) for all four historical pattern generations from ahungry/bg3-linux-ae: 'MODDED 20260327' (27 1b 04 0f 94 c0), 'MODDED 20260216' (76 1b 04 ...), 'MODDED 20251120' (62 1a 04 ...), and the original (0c 1b 04 ...) \u2014 0 hits each. Likewise MODDED2 (all three variants a3/a5/a6 00 84 c0 0f 84 c3 00 00 00) and MODDED3 (4d/4e 01 84 c0 74 0b) \u2014 0 hits each. The author had to re-derive these three times in four months. Our binary is 4.1.1.7398727.",
+   "BG3 WASD movement is NOT implemented by synthesised mouse clicks, and not by any move API. Ch4nKyy/BG3WASD src/InputconfigPatcher.cpp rebinds the four CharacterMove* commands to the CameraForward/Backward/Left/Right keys in inputremap_pN.json, and doc/guide.md states the whole design in three lines: 'Assign the CharacterMoveForward etc commands, which are usually for analog controller movement, to some keyboard keys in the input config / The game usually ignores this input when the controller UI is inactive, but WASDUnlockPatch overrides this check / Everything else is just QoL and bonus features.' AutoHotkey appears only as an OPTIONAL extra for caps-lock mode toggle and shift+W autorun \u2014 not as the movement mechanism.",
+   "The game does not import SDL_PushEvent or SDL_SetRelativeMouseMode. Of 71 SDL_* symbols in the binary, a targeted query for ('SDL_PollEvent','SDL_PushEvent','SDL_PeepEvents','SDL_SetRelativeMouseMode','SDL_WarpMouseInWindow','SDL_GetWindowGrab','SDL_GameControllerGetAxis','SDL_GetKeyboardState') returned only SDL_PollEvent, SDL_WarpMouseInWindow and SDL_GetWindowGrab. This kills any design that assumes you can shove events into the game's queue by calling the game's own SDL_PushEvent \u2014 and it is exactly why bg3se's SDLManager::InjectEvent maintains its own vector drained inside the SDL_PollEvent hook rather than calling SDL_PushEvent. (A preloaded .so can of course still link SDL_PushEvent itself, as BG3WASD's InputFaker does.)",
+   "No vk* symbols at all (sqlite count = 0), so Vulkan is not reachable through the PLT; it must be loaded indirectly. Any overlay plan must go through a Vulkan implicit layer or through SDL, not through interposing vkQueuePresentKHR on the main binary.",
+   "There is essentially no native-Linux BG3 native-code modding community. A GitHub search for BG3+Linux repos returns mod *managers* (mac-bg3mm, BG3ModManager-LinuxLauncher, OneHornModManager, bg3-linux-mod-manager) and exactly one native code mod: ahungry/bg3-linux-ae. Nexus mod 23896 'Linux Native Camera Tweaks' exists and is described as native Linux, but nexusmods.com returns HTTP 403 to automated fetch and I could not locate source or confirm its injection technique \u2014 treat its existence as confirmed and its method as unknown. Larian's own position (larian.com FAQ, and the Steam depot being Deck-flagged) is that the native build is Steam Deck only and unsupported elsewhere; the community guidance is 'native is faster IF you only use .pak mods and no Script Extender'.",
+   "The Windows DLL-proxy injection concept has no direct analogue worth copying. bg3se's BG3Updater/DWriteWrapper.cpp LoadLibrary's the real system DWrite.dll and forwards DWriteCreateFactory; dllmain.cpp runs StartUpdaterThread() on DLL_PROCESS_ATTACH; Updater.cpp then fetches a manifest and picks a build via FindResourceVersionWithOverrides(resourceName, gameVersion, config). None of the proxy machinery is needed on Linux \u2014 LD_PRELOAD with an __attribute__((constructor)) does the same job in three lines (see bg3_linux_ae.cpp init_patch). The *versioned-manifest* idea is worth keeping; the DLL-proxy plumbing is not.",
+   "Norbyte's symbol-recovery trick is unavailable to us but also unnecessary. He told issue #539: 'A lot of the functions were mapped through the Toolkit binaries; the toolkit is not a single .exe but is split into many DLL-s and exports a lot of the internal game functions using names; it also has assertions enabled (which is why we know the function is called esv::SavegameManager::ThrowError).' SymbolTableGenerator/SymbolTableGenerator.cpp confirms this \u2014 it is a DIA/msdia140.dll PDB reader. We have no Toolkit and no PDB; we have .rela.text plus 206 .L__FUNCTION__ and 11,375 .L__PRETTY_FUNCTION__ statics, 47 of which are ecl/esv/eoc-scoped mangled names, which recover Larian function identities directly (verified: ecl::EocClient::HandleError -> 0x05a41fda)."
+  ],
+  "open_questions": [
+   "Where is the controller-mode gate in the Linux binary? This is the single load-bearing unknown for a WASD port. BG3WASD NOPs a cmp/jz on a global byte inside the predicate at the top of UpdateWasdMove; Native Camera Tweaks locates the same global with pattern '80 3D ?? ?? ?? ?? ?? 74 22'. Concrete next step: walk callers of the two movement readers I found (0x2c75cd0, 0x0290a850) and examine the cmove at 0x0290a876-0x0290a892 that switches command IDs between 0x9d/0x9e/0x9f and 0x68/0x69/0x6c \u2014 that branch looks like the mode selector.",
+   "Is the inputremap JSON path alone sufficient on the native Linux build? If Larian's Linux build reads a different config location (the native save path is ~/.local/share/Larian Studios/Baldur's Gate 3/ per Larian's FAQ, not the Proton prefix), the pure-data half of the WASD technique may need a different file path. Cannot verify without the game data.",
+   "Was the shipped libSDL2.so built with SDL_DYNAMIC_API enabled? That decides whether the officially-supported, zero-patching SDL_DYNAMIC_API=/path/to/mylibSDL2.so override is available as an alternative to LD_PRELOAD. Needs the actual .so from a game install.",
+   "Does libOsiris.so export the same clean C++ symbols on Linux that bg3se-macos found in libOsiris.dylib (1,013 symbols incl. COsiris::InitGame, COsiris::Load, _DefineFunction)? If yes, an Osiris event/scripting layer is nearly free via LD_PRELOAD interposition. Needs the .so.",
+   "What technique does Nexus mod 23896 'Linux Native Camera Tweaks' actually use \u2014 LD_PRELOAD, a patched ELF, or something else? It is the only other known native-Linux BG3 code mod besides bg3-linux-ae and would be direct competition/collaboration. nexusmods.com blocks automated fetch (HTTP 403); this needs a manual browser visit or contacting the author.",
+   "How stable are our reloc-derived addresses across Larian hotfixes? bg3se-macos's port_offsets.py assumes a mostly-uniform segment shift with named exceptions ('component_data_shift validated' vs 'REJECTED... migrate TypeIds independently by exact symbol'). We should test our address table against a second BG3 Linux build to learn whether the same uniform-shift heuristic holds for the ELF, before committing to it.",
+   "Norbyte's 99 mapped symbols are a validated 'what an extender needs' inventory. How many of them can we resolve in our binary today via strings/relocs/.L__FUNCTION__ statics? Worth running as a systematic sweep \u2014 it would quantify the gap between us and feature-parity with the Windows SE, the same way bg3se-macos publishes a per-API parity matrix.",
+   "Should we upstream anything? bg3se issue #539 has an active audience (four separate users asking for native Linux support through 2026-04), and tdimino/bg3se-macos has solved the non-Windows SE problem once already with a documented, reusable porting methodology. Reusing their offset-manifest tooling \u2014 or coordinating so a Linux backend lands in the same project \u2014 may be far cheaper than a from-scratch framework."
+  ]
+ },
+ {
+  "dimension": "camera",
+  "summary": "The client camera is ECS-driven: every camera entity carries ls::CameraComponent (0xb0 bytes; byte 0 = owning-behavior mode enum, observed 8=game, 11=scene, 12=spectator; byte 0x14 = active flag), ecl::EocCameraBehavior (0x40 bytes; int16 player index at +0x38), ls::TransformComponent (0x28: quat@+0x00, pos@+0x10, scale@+0x1c), plus one behavior component \u2014 ecl::GameCameraBehavior (0x258 bytes) for the gameplay camera. The per-entity game-camera update is the anonymous function at 0x2c7d3a0 (dispatched from the CameraSystem update at 0x221aac0 when mode==8); it stores yaw NOT as an angle but as two normalized XZ direction vectors in GameCameraBehavior (+0x70 current, +0x7c target), with a rotation-remaining accumulator in degrees at +0xac, a follow-desired direction at +0xd0, a manual-control cooldown at +0x13c, and pending \"move camera here\" vec3+flag channels at +0x238/+0x244 and +0x248/+0x254 that the engine itself uses to recenter the camera (committed after screen-fade completion). Follow-the-character already exists: the update resolves ecl::camera::TargetComponent entities, fetches their eoc::character::CharacterComponent/ls::TransformComponent and the splitscreen MergedFocus singleton, and steers the target direction toward them with a powf speed curve whose parameters come from mouse-vs-controller config blocks at gSettings(+0x7c4/+0x958, override +0xc80/+0xdac) under the global pointer at 0x7d9d198. All camera inputs are named, numbered input events registered at 0x4144400 (CameraCenter=0x61 \u2026 CameraRotateMouseLeft/Right=0x6d/0x6e, full FreeCamera suite 0x6f\u20130x86 including mouse pitch, ToggleTacticalCamera=0xd9), so mouse-look yaw exists natively for the game camera but pitch mouse-look exists only in the FreeCamera/PhotoMode path. For WASD, \"forward\" can be read directly from GameCameraBehavior+0x70 (XZ direction) or from the camera entity's TransformComponent quaternion.",
+  "key_addresses": [
+   {
+    "addr": "0x2c7d3a0",
+    "what": "GameCameraBehavior per-entity update function (~0x2c7d3a0-0x2c85565, anonymous). Signature: f(system_this, ecs_ctx, time*, row_ctx*); dt is time[2]. Contains all yaw/follow/zoom logic.",
+    "evidence": "Called from the CameraSystem update at 0x221d5xx with a struct of component-row pointers; references ecl::camera::TargetComponent TypeId at 0x2c7d67e, CharacterComponent at 0x2c7da50, LevelComponent/TransformComponent at 0x2c7dc26/0x2c7dc34; sinf/cosf/atan2f/powf cluster 0x2c7ef70-0x2c80832; Ghidra decompilation of carved region recovered field usage."
+   },
+   {
+    "addr": "0x221aac0",
+    "what": "CameraSystem frame update (anonymous, ~17KB, ends ~0x221f01f). Iterates all camera behavior queries (Game/Scene/Spectator/PhotoMode), does behavior interpolation and dispatches 0x2c7d3a0 for mode==8 entities.",
+    "evidence": "Prologue after int3 pad at 0x221aac0; references main query Spec<GameCameraBehavior,CameraComponent,EocCameraBehavior,TransformComponent> TypeId at site 0x221b7e0, GameCameraBehavior TypeId at 0x221b4b3 with size 0x258 (mov r9d,0x258 at 0x221b4cd), photo-mode/screen-fade queries, RenderFrameSystem TypeId at 0x221e5df."
+   },
+   {
+    "addr": "0x7c356b0",
+    "what": "ls::TypeId<ecl::GameCameraBehavior, ecs::ComponentTypeIdContext>::m_TypeIndex \u2014 4-byte static holding the live runtime type index; component size is 0x258 (600) bytes.",
+    "evidence": "bg3q comp listing; size proven twice: 'mov r9d,0x258' at 0x221b4cd and 'mov r8d,0x258' at 0x2c80251, both adjacent to this TypeId load feeding a GetComponent-style helper (0x2565a10 / 0x24760b0)."
+   },
+   {
+    "addr": "GameCameraBehavior+0x70 / +0x7c",
+    "what": "Camera facing stored as normalized XZ direction vectors: current at +0x70 (floats [0x1c..0x1e]), target at +0x7c ([0x1f..0x21]). +0xac = rotation-remaining accumulator in DEGREES; +0xd0/+0xd4 = desired follow direction; +0xa8/+0xa9 = flag bytes (a9 bit0 suppresses auto-rotate); +0x13c = manual-control cooldown float; +0x14c/+0x14d = in-selector-mode bool now/prev; +0x2c vec3 = current pivot position (lerped); +0x5c = zoom/distance default loaded from config+0xc4.",
+    "evidence": "Decompiled 0x2c7d3a0: atan2f(dir cross/dot)*57.295776 between [0x1c]/[0x1e] and [0x34]/[0x35], powf(angle/180) speed curve from config, accumulate into pfVar9[0x2b] (+0xac) clamped to 360 or gSettings+0x69c, yaw quaternion built via sinf/cosf, rotated vector normalized and stored to pfVar9[0x1f..0x21] then copied to [0x1c..0x1e]."
+   },
+   {
+    "addr": "GameCameraBehavior+0x238/+0x244 and +0x248/+0x254",
+    "what": "Two pending 'set camera position' channels: vec3 + dirty-flag byte. Engine commits them into live fields (+0x24 and +0x48) inside 0x221aac0, gated on per-player screen-fade completion (fade IDs table at 0x7c1e5b0, indexed by EocCameraBehavior+0x38 player index).",
+    "evidence": "Decompiled 0x221aac0 lines: if(byte[row+0x254]) {[row+0x50]=[row+0x250]; [row+0x48]=[row+0x248]; byte=0;} similarly +0x244\u2192+0x24; commit path calls helper 0x43a05c0 which reads Spec<ecl::screen_fade::ScreenFadeToFinishedOneFrameComponent> and compares against 16-byte entries at 0x7c1e5b0."
+   },
+   {
+    "addr": "0x7d9d198",
+    "what": "Global pointer to the camera settings/config singleton (nearest symbol is unrelated; this is Larian data). Offsets: +0x69c max-rotate degrees, +0x6a4 enable, +0x6bc rotate angle deg, +0x7c4 = keyboard/mouse camera config block, +0x958 = controller config block, +0xc80/+0xdac override blocks, +0x1362 override-enable byte. In-block: +0xc4 default zoom/distance, +0x12c/+0x130 rotation speed min/max.",
+    "evidence": "Loaded at 0x221c515 (mov rax,[rip+0x5b80c7c]) and 110 times in the decompiled 0x2c7d3a0; config chooser pattern 'if(g+0x1362==0) cfg=(flags&1)?g+0x958:g+0x7c4; else g+0xc80' appears 3+ times; angle at +0x6bc multiplied by 0.017453 (\u03c0/180, .LCPI173810_4 at 0x1b7618c) then 0.5 for a half-angle quaternion."
+   },
+   {
+    "addr": "0x4144400",
+    "what": "Input-event registration function: registers every camera input event with GUID, numeric id, and name into the input registry object stored at global 0x7d9d0a8 via registrar call 0x4643840. IDs: 0x61 CameraCenter, 0x62 CameraToggleMouseRotate, 0x63/0x64 Backward/Forward, 0x65/0x66 Left/Right, 0x67-0x69 Zoom/In/Out, 0x6a-0x6c Rotate/Left/Right, 0x6d/0x6e CameraRotateMouseLeft/Right, 0x6f-0x86 full FreeCamera suite (move, FoV, speed, mouse+controller rotate incl. Up/Down pitch, height, slowdown, FreezeGameTime), 0xd9 ToggleTacticalCamera.",
+    "evidence": "Disassembly at 0x4144400+: repeating pattern GUID string, 'mov dword ptr [r14], 0xNN', name string (e.g. str 'CameraForward' at 0x04144658 with id 0x64), call 0x4643840 with registry from [rip+0x3c58c8d]=0x7d9d0a8."
+   },
+   {
+    "addr": "0x7c1e700",
+    "what": "QueryRegistry static for the main game-camera query Spec<GameCameraBehavior, ls::CameraComponent, EocCameraBehavior, ls::TransformComponent | optional camera::PlatformTargetComponent, camera::SelectorModeComponent, eoc::controller::NudgeDataComponent>. Query objects are resolved as queryRegistryBase + m_TypeIndex*0x58.",
+    "evidence": "bg3q comp listing; resolution idiom observed at 0x221b5ad: 'movsxd rax,[TypeId]; imul rax,rax,0x58; add rax,[rcx]' where rcx=[ctx+0x18]."
+   },
+   {
+    "addr": "0x2c801ec-0x2c8026e",
+    "what": "Proof of component sizes: ecl::EocCameraBehavior = 0x40, ls::CameraComponent = 0xb0, ecl::GameCameraBehavior = 0x258. EocCameraBehavior +0x38 = int16 player/user index (used for player lookup via helper 0x26982c0). ls::CameraComponent byte0 = behavior-mode enum (8=game camera path, 11=scene, 12=spectator observed), byte +0x14 = active flag, ptr at +0x8.",
+    "evidence": "Back-to-back GetComponent calls: 'mov r9d,0x40' with EocCameraBehavior TypeId (0x2c801ec), 'mov r8d,0xb0' with ls::CameraComponent TypeId (0x2c8021a), 'mov r8d,0x258' with GameCameraBehavior TypeId (0x2c8024a); mode-byte tests '*(char*)(row*0xb0)==8/11/12' in decompiled 0x221aac0 select which behavior block runs."
+   },
+   {
+    "addr": "0x88-stride component = ecl::SpectatorCameraBehavior",
+    "what": "Layout recovered: +0x00 pos vec3, +0x0C rotation quat, +0x1C float4 fov/params, +0x30 interp speed (reset to 5.0), +0x34 target pos, +0x40 target quat, +0x50 target fov (radians, stored deg*\u03c0/180), +0x70 entity handle (0xffc0000000000000 = null), +0x80 int camera-definition index into an 0x58-stride definition array (fov deg @+0x18, quat @+0x24, pos @+0x4c; default fov at defs_mgr+0xc0).",
+    "evidence": "Decompiled interpolation block in 0x221aac0 (mode==12 loop, query 0x7c1e6d0 Spec<EocCameraBehavior, SpectatorCameraBehavior, ls::CameraComponent | opt GameCameraBehavior>); slerp with dot<0.95 acosf path at 0x221d094; snap-vs-ease flag at source obj+0x98."
+   },
+   {
+    "addr": "0x7c1d948 / 0x7b7c070",
+    "what": "ecl::camera::CameraModeTrackerSingletonComponent TypeId / CameraModeTrackerSystem TypeId. Mode singleton is registered lazily from GUI code (0x65892f0) and consumed by Noesis UI bindings (sites 0x6589312, 0x6604009) \u2014 tactical-camera UI state flows through here; 'ToggleTacticalCamera' (0x4148917) is only an input event, not a separate behavior component.",
+    "evidence": "bg3q comp + xrefs; registration disassembly at 0x4b6b0f0 (system ctor registering singleton + 0x38-byte listener); str 'ToggleTacticalCamera' used only in the input registration function."
+   },
+   {
+    "addr": "0x7c95eb0 / 0x7c95d50",
+    "what": "eoc::camera::MoveComponent queries: written by server-side AI/swarm requests (eoc::ai::combat::RequestCameraMoveComponent, eoc::ai::swarm::RequestCameraFollowGroupComponent) and acknowledged via esv::camera::ArrivedPlayersComponent \u2014 the engine's scripted 'move camera' channel; ecl::camera::ArrivedSystem (0x7b7bff0) reports client arrival.",
+    "evidence": "QueryRegistry statics listed by bg3q comp: Spec<RequestCameraMoveComponent | write MoveComponent> at 0x7c95ef0, Spec<MoveComponent, ArrivedPlayersComponent> at 0x7c95d70."
+   },
+   {
+    "addr": "0x2c8aa50",
+    "what": "Large camera-manager method (this-relative offsets 0x28a0-0x2af8) containing the quat\u2194euler conversion core (asinf/atan2f pairs at 0x2c8c5ce/0x2c8c62c, 0x2c8f197/0x2c8f1fb, 0x2c8fbf1/0x2c8fc4f) and per-axis powf smoothing \u2014 the final composer of camera transforms referencing ls::TransformSystem TypeId (0x2c8ae22).",
+    "evidence": "Prologue at 0x2c8aa50 after int3 pad; xref dump of 0x2c8ab6e-0x2c8fffe shows the trig cluster (.LCPI305347 constant family)."
+   }
+  ],
+  "hook_points": [
+   {
+    "where": "Read yaw: GameCameraBehavior+0x70 (current XZ direction vec3) of the local player's camera entity, or the camera entity's ls::TransformComponent quaternion (stride 0x28, quat at +0x00, position at +0x10)",
+    "how": "Resolve the live type index from the statics (GameCameraBehavior: 0x7c356b0, ls::TransformComponent: 0x7d5dde8), then use the engine's own query path: queryObj = [queryRegistry] + Spec-TypeIndex*0x58 (Spec<GameCameraBehavior, ls::CameraComponent> static at 0x7c1e660 gives exactly the game-camera entities), or the GetComponent helpers 0x2565a10/0x24760b0(world, entity, ctx, typeIdx&0x7fff, size). Match the local player via EocCameraBehavior+0x38 int16 player index. WASD forward = normalize(dir.xz); no trig needed since the engine itself stores the direction vector.",
+    "risk": "Read-only \u2014 negligible. Field offsets verified against Patch-8 GustavX Linux build only; re-verify on patch (offsets are not covered by any stability guarantee).",
+    "confidence": "high"
+   },
+   {
+    "where": "Inject native camera input events (ids 0x61-0x6e for game camera, 0x6f-0x86 free camera, 0xd9 tactical toggle) at the input registry object stored at global 0x7d9d0a8",
+    "how": "Hook or call the input-event dispatch used by the registrar at 0x4643840's registry; synthesizing CameraRotateMouseLeft/Right (0x6d/0x6e) gives native smooth yaw mouse-look, CameraZoomIn/Out (0x68/0x69) zoom, CameraForward/Left etc. (0x63-0x66) panning. The events are already remappable and handled with the engine's own speed curves and clamps.",
+    "risk": "Medium \u2014 the dispatch-side consumer function for these ids was not located in this pass (registration side only); need to trace one dispatch call before writing the injector. Event ids could shift between patches (extract them from the registration table at 0x4144400 at runtime instead of hardcoding).",
+    "confidence": "medium"
+   },
+   {
+    "where": "Post-hook the per-entity game camera update at 0x2c7d3a0",
+    "how": "Detour the function (called only for camera entities whose ls::CameraComponent mode byte == 8); after the original runs, overwrite GameCameraBehavior+0x7c (target direction) and/or +0x2c (pivot position) from your own mouse-look state \u2014 the engine's smoothing then interpolates +0x70 toward it. param_4 hands you all component rows: +0x00 GameCameraBehavior, +0x10 CameraComponent, +0x20 EocCameraBehavior, +0x30 TransformComponent, +0x40/+0x50/+0x60 optional PlatformTarget/SelectorMode/NudgeData rows; dt = param_3[2].",
+    "risk": "Medium-high \u2014 anonymous function, address must be found per-binary-version by signature (e.g. the 0x40/0xb0/0x258 GetComponent triple at 0x2c801ec is a good scan anchor); interactions with cutscene/photo/spectator transitions need the mode byte respected or the camera fights you.",
+    "confidence": "high"
+   },
+   {
+    "where": "Write the engine's own pending-position channel: GameCameraBehavior+0x248 (vec3) + flag byte +0x254 (or +0x238/+0x244 pair)",
+    "how": "For follow-cam: each frame write the character position into +0x248 and set +0x254; the CameraSystem update (0x221aac0) commits it through its normal path (including screen-fade gating), giving free smoothing and no fighting with the engine. Combine with ecl::camera::TargetComponent (TypeId 0x7c20730) \u2014 attaching/retargeting the existing follow-target mechanism is the most native 'follow the character' option since the update already resolves target transforms and splitscreen merged focus.",
+    "risk": "Low-medium \u2014 semantics of the two pending channels (which one is look-at vs camera position) inferred from commit targets (+0x24 vs +0x48), not yet confirmed by observing gameplay; TargetComponent's writer (ecl::camera::TargetSystem, 0x7c23f50) wasn't reversed, so a competing writer may clear the target every frame.",
+    "confidence": "medium"
+   },
+   {
+    "where": "Patch camera tuning data in the settings singleton at [0x7d9d198]: config blocks +0x7c4 (kb/mouse) / +0x958 (controller), rotation speeds +0x12c/+0x130 in-block, default zoom +0xc4, max-rotate +0x69c, plus the pitch/zoom clamp constants in rodata (.LCPI173817 family, e.g. 0x1b75928: -5\u00b0/60\u00b0 pair, 0x1b75d1c: 30\u00b0)",
+    "risk": "Low for the in-memory settings blocks (data-only, this is what 'Native Camera Tweaks' effectively does on Windows); rodata constant patching needs mprotect and is version-fragile.",
+    "how": "One-time memory writes after the settings object is constructed (the pointer at 0x7d9d198 is filled at startup); unlock zoom/pitch range by widening the clamps the update reads every frame.",
+    "confidence": "medium"
+   },
+   {
+    "where": "FreeCamera path for full mouse-look including pitch",
+    "how": "The client ships a complete free camera: ecl::FreeCameraBehavior + input events 0x6f-0x86 (FreeCameraRotateMouseUp/Down = pitch, move fwd/back/left/right, height, speed, FreezeGameTime). A mod that toggles the camera into free mode and re-implements follow by writing its position each frame gets unrestricted orientation without touching GameCameraBehavior's yaw-only model. PhotoMode components (ecl::camera::PhotoModeCameraInputComponent 0x7c21240, query 0x7c20ed0 writing EocCameraBehavior + ls::CameraComponent) are the shipping example of an alternate behavior driving the camera.",
+    "risk": "Medium \u2014 how FreeCameraBehavior is activated (likely dev/photo-mode gated) was not traced; may require setting the ls::CameraComponent mode byte and adding the behavior component to the camera entity, and gameplay systems (picking, click-to-move) may assume the game-camera model.",
+    "confidence": "medium"
+   }
+  ],
+  "negative_results": [
+   "No over-the-shoulder or first-person camera behavior exists anywhere in the client: the complete behavior set is Game/Eoc/Scene/Spectator/FreeCamera/PhotoMode (ecl::) plus editor-family ls::Default/ArcBall/Ortho/WorldMap/Effect/EditorCameraBehavior which appear ONLY as GetTypeName pretty-function statics (no ecl code references) \u2014 a shoulder cam must be built, not enabled.",
+   "GameCameraBehavior stores no pitch angle field: yaw is a normalized XZ direction vector (+0x70/+0x7c) \u2014 pitch never appears as free state in the game-camera update; it is derived from zoom/config curves (clamp constants 30\u00b0/60\u00b0/\u00b15\u00b0/-90\u00b0 inline in .LCPI173817). Consistent with the input table: there are NO game-camera pitch input events; mouse pitch (RotateMouseUp/Down) exists only in the FreeCamera set (0x81/0x82).",
+   "'ToggleTacticalCamera' (id 0xd9) is only an input event consumed via Noesis UI delegates \u2014 there is no TacticalCameraBehavior component or tactical camera system; tactical view is a parameter change within GameCameraBehavior, tracked for UI via CameraModeTrackerSingletonComponent.",
+   "No _ZTV/_ZTI RTTI for any ecl::/esv::/eoc:: camera type (re-confirmed via symbol search) \u2014 runtime discovery must go through the ls::TypeId statics, which is viable because they hold live indices.",
+   "Camera yaw is never persisted as an angle anywhere in the game-camera path \u2014 atan2f results exist only transiently for the speed curve; mods wanting an angle must compute atan2(dir.x, dir.z) themselves.",
+   "The four references to the main query Spec (0x7c1e700) and the 122 references to GameCameraBehavior's TypeId are all in anonymous Larian code; nearest-symbol labels (Noesis/crashpad/etc.) are meaningless for these sites \u2014 do not trust +offset symbol attributions in this region.",
+   "eq: the 0x7c1e5b0 '16-byte per-player' table is screen-fade IDs, not camera state \u2014 camera position commits are deliberately deferred until fades finish, so instant camera teleports via the pending channel will be delayed if a fade is active."
+  ],
+  "open_questions": [
+   "Where exactly are the game-camera input events consumed (the dispatch/listener side of registry 0x7d9d0a8)? The registration side and per-event ids are mapped, but the handler that turns CameraRotateMouseLeft into GameCameraBehavior state changes was not located \u2014 needed before synthetic-event injection can be trusted.",
+   "Full layout of ecl::GameCameraBehavior beyond the ~20 verified fields (0x258 bytes total; ~0x100-0x230 region unmapped) \u2014 zoom current/target and the pitch-curve inputs are in there (candidates: floats [0x25]/[0x26] at +0x94/+0x98 and the vec3s at +0x44/+0x50).",
+   "CameraModeTrackerSingletonComponent field layout and its mode enum values (component recovered, registration found at 0x4b6b0f0, but the tracker system's mode derivation was not reversed) \u2014 needed if the mod wants to report/react to tactical-view state cleanly.",
+   "How FreeCameraBehavior is activated in retail builds (dev-console gating?) \u2014 the input events and component exist; the activation path (who adds the component / flips ls::CameraComponent mode byte) is unknown.",
+   "Semantics of the two pending channels (+0x238\u2192+0x24 vs +0x248\u2192+0x48): which is camera position vs look-at target \u2014 inferable in 30 minutes by reversing the +0x24/+0x48 consumers in 0x2c7d3a0.",
+   "Whether ecl::camera::TargetSystem (TypeId 0x7c23f50) rewrites TargetComponent every frame from party state (would fight a mod-set target), and what TargetComponent's layout is (entity handle + weight?).",
+   "The settings singleton at [0x7d9d198]: which game data file feeds the camera config blocks (+0x7c4/+0x958) \u2014 knowing the data path might allow a zero-code mod for limits, as Native Camera Tweaks does on Windows."
+  ]
+ },
+ {
+  "dimension": "gamepad",
+  "summary": "The controller path is real and fully mapped: BG3-Linux consumes gamepads 100% event-driven through a SINGLE SDL_PollEvent site (0x2e9e7c7) \u2014 it never polls axis state (no SDL_GameControllerGetAxis/Update imports exist), so a virtual pad is trivially injectable either via uinput (the DEVICEADDED handler at 0x2e9eade hotplug-opens any pad) or by LD_PRELOAD-interposing ~15 PLT-imported SDL functions. However, input events are tagged deviceType=3+controllerIndex and feed a single input-mode arbiter (0x500c4f0) whose only two outcomes are ActivateControllerMode (0x500bec0) and EnsureKBM (0x500c270) \u2014 byte-scan proved these are the ONLY runtime switchers \u2014 and mode change triggers a WHOLESALE Noesis UI reload: 0x5f16fc0 calls GUI::LoadApplicationResources with 'Theme/DefaultTheme_c.xaml' vs 'Theme/DefaultTheme.xaml' (plus StateMachine_c.xaml etc.), so naive virtual-pad + real mouse = constant heavyweight UI thrash between pad and KBM themes. The escape hatch: all four switch paths are guarded by two config bytes ([cfg@[base+0x7D5C040]]+0x221/+0x222 \u2014 if bit0 set, switching is suppressed), which an in-process shim can poke to pin the KBM UI. Verdict: pure uinput is a dead end for shipping; LD_PRELOAD fake-pad + mode-freeze poke is a strong prototype stepping stone, with one decisive unknown remaining (whether gameplay consumes stick\u2192CharacterMoveForward actions while UI mode stays KBM \u2014 a 30-minute runtime test). Cheapest possible win also discovered: CharacterMoveForward/Backward/Left/Right are ordinary registered input actions (id 0x9d.., marked '- internal', excluded from rebind UI but in the same raw-input space as keyboard keys), and bindings live in data (PlayerProfiles/Eoc/keyboard_1.json), so WASD may be achievable with zero code if the binding parser accepts keyboard bindings for internal actions.",
+  "key_addresses": [
+   {
+    "addr": "0x2e9e7c7",
+    "what": "The game's ONLY SDL_PollEvent call site \u2014 central input pump for window/kb/mouse/controller",
+    "evidence": "sqlite xrefs: dst=SDL_PollEvent(id 151366) returns exactly one site 0x2e9e7c8 (reloc within instruction at 0x2e9e7c7 'call SDL_PollEvent'); disassembly shows poll loop with event-type switch"
+   },
+   {
+    "addr": "0x1BCCC38",
+    "what": "Jump table for SDL controller events 0x650-0x655",
+    "evidence": "decoded int32 table: AXISMOTION->0x2e9e809, BUTTONDOWN->0x2e9eb5b, BUTTONUP->0x2e9ea4b, DEVICEADDED->0x2e9eade, DEVICEREMOVED->0x2e9ea38, DEVICEREMAPPED->ignored (0x2e9e7c2 = poll-next)"
+   },
+   {
+    "addr": "0x2e9eade",
+    "what": "CONTROLLERDEVICEADDED handler: live hotplug open+register \u2014 a virtual pad appearing at runtime IS picked up",
+    "evidence": "dis: SDL_IsGameController -> SDL_GameControllerOpen -> SDL_GameControllerGetJoystick -> SDL_JoystickInstanceID -> insert into device hashmap at [mgr+0x88]"
+   },
+   {
+    "addr": "0x2e9ed70",
+    "what": "Stick deadzone + event synthesis: deviceType = 3 + controllerIndex",
+    "evidence": "dis: squared-magnitude compare vs deadzone dword at [[0x7D9D198]+0xa0] (cmovb zeroes value), suppress-if-unchanged (cmp bp,dx; je poll), then 'add r9d,3' and event id = (deviceType<<16)|code queued via 0x2e9fb70; inverse 'add r14d,-3' before SDL_IsGameController at 0x5a2546e (LED path) confirms the +3 convention"
+   },
+   {
+    "addr": "0x2e9fb70",
+    "what": "Event injection into input manager: mutex-guarded 0x25-entry ring buffer at [mgr+0x3e0]",
+    "evidence": "dis: pthread_mutex_trylock, bounds check [rbx+0x3e8] vs [rbx+0x3ec], 20-byte event record stored; ring allocated in ctor at 0x4fdda9c"
+   },
+   {
+    "addr": "0x7D9D0A8",
+    "what": "Input manager singleton pointer (bss)",
+    "evidence": "loaded by pump (0x2e9e7d4), by startup mode selection (0x335a6cf), by EnsureKBM (0x5a42554); 139 reloc'd references total"
+   },
+   {
+    "addr": "0x500c4f0",
+    "what": "InputModeArbiter(this, bool, deviceType, bool): the ONE runtime decision function for input-mode switching (virtual; thunk 0x500c4e0 in vtable slot 0x78c47b8)",
+    "evidence": "dis: 'cmp r14w,2 / jae' splits mouse-kb (types 0,1) from 'lea eax,[r14-3]; cmp ax,3' controller family (types 3-6); tail-jmps to 0x500c770 (activate controller) at 0x500c647 or 0x5a42550 (ensure KBM) at 0x500c738; whole-.text E8/E9 scan found no other callers of the switch functions"
+   },
+   {
+    "addr": "0x500bec0",
+    "what": "SwitchToController(mgr, deviceId=3 default) \u2014 sets global byte 1, resolves device of type 3 in registry, updates last-device slots",
+    "evidence": "dis: 'cmp si,-1; mov ebx,3; cmovne' + hashtable walk comparing 'word ptr [rdx+8], 3'; complete caller list (byte-scan): 0x335a6db (-startInControllerMode), 0x335a8f2 (Steam Deck default), 0x500c7a9 (ActivateControllerMode)"
+   },
+   {
+    "addr": "0x500c270",
+    "what": "SwitchToKBM \u2014 complete caller list: 0x335a7a1 (startup default) and 0x5a42591 (EnsureKBM 0x5a42550)",
+    "evidence": "whole-.text scan for E8/E9 rel32 targeting 0x500c270 returned exactly those two sites; both paths then broadcast device type (esi=0) to a listener array"
+   },
+   {
+    "addr": "0x7D5C040",
+    "what": "Config-object pointer whose bytes +0x221/+0x222 (bit 0) SUPPRESS all mode switching when set \u2014 the mode-freeze lever",
+    "evidence": "guard 'test cl,1; jne return' on [cfg+0x221] then [cfg+0x222] appears in ActivateControllerMode (0x500c77c/0x500c787), EnsureKBM (0x5a42571/0x5a4257c), and both startup branches (0x335a6ba/0x335a6c5, 0x335a8c9/0x335a8d8); bytes are written as (value,isSet) pairs by the config deserializer switch at 0x2ff61f0/0x2ff622c (function 0x2ff3ed0)"
+   },
+   {
+    "addr": "0x5f16fc0",
+    "what": "UI theme reload on mode change: full Noesis application-resource swap between KBM and controller UI",
+    "evidence": "dis: reads mode from [ui+0x2d70], 'cmp ebp,1' selects 'Theme/DefaultTheme.xaml' (str 0x1ad69d8) vs 'Theme/DefaultTheme_c.xaml' (str 0x1a49874) then calls Noesis::GUI::LoadApplicationResources (0x53f1d50); same function loads DefaultThemeLibs_c.xaml, StateMachine_c.xaml/_c variants"
+   },
+   {
+    "addr": "0x4cea860",
+    "what": "UI mode-change listener: maps deviceType to UI mode and marks theme dirty",
+    "evidence": "dis: 'cmp r14w,2 / jb' then 'add r14d,-3; cmp r14w,4' converts type to mode value, compares [rbx+0x2d70], sets dirty bit 0x1000 in [rbx+0x2d7d], stores new mode at 0x4cea89e"
+   },
+   {
+    "addr": "0x5043e00",
+    "what": "Sets UI resource 'UI_InputDevice' to KBM vs PAD variant per device type",
+    "evidence": "dis: 'cmp si,2 / cmovb' selects str 'UI_InputDevice_KBM' (0x19caabc) vs 'UI_InputDevice_PAD' (0x1a9e4d9), keyed by 'UI_InputDevice' (0x192fee9)"
+   },
+   {
+    "addr": "0x335a692",
+    "what": "Startup mode selection: '-startInControllerMode' / '-startInKeyboardMode' command-line flags + Steam Deck auto-controller",
+    "evidence": "dis: strcmp vs str 0x1a1fd1d then SwitchToController + broadcast(3) + [0x7D9D198+0x38]=2; SteamAPI_IsSteamRunning + SteamUtils vtable+0x110 (IsSteamRunningOnSteamDeck) at 0x335a720-0x335a755 gates controller-default unless '-startInKeyboardMode' (str 0x19288b0, checked 0x335a8a7)"
+   },
+   {
+    "addr": "0x414654a",
+    "what": "'CharacterMoveForward' registered as input action id 0x9d (Backward 0x9e...), description 'Character move forward - internal' \u2014 native analog character movement actions exist as first-class bindable actions",
+    "evidence": "dis of master action-registration fn: [r14]=0x9d, str 0x1a88c54 len 0x14, call 0x4643840(edx=0x20, ecx=4); description string 0x1a88c32 reached via GUID-struct 0x79EBB60 reloc; contrast 'CameraForward' id 0x64 (edx=0x10, ecx=4) and 'ToggleInputMode' id 0xc0 (0x4147972, edx=0x20, ecx=2)"
+   },
+   {
+    "addr": "0x407c508",
+    "what": "Raw-input enum: LeftStickX=0x8a, LeftStickY=0x8b (Noesis TypeEnum registration) \u2014 stick axes share one raw-input id space with keys/mouse",
+    "evidence": "dis: Noesis::SymbolManager::AddStaticString('LeftStickX') + TypeEnum::AddValue(sym, 0x8a), then LeftStickY 0x8b, LeftStickXNeg etc."
+   },
+   {
+    "addr": "0x1b48c39",
+    "what": "Per-mode binding profiles are data: 'PlayerProfiles/Eoc/keyboard_1.json' and 'controller_1.json' (0x1b5af15), plus _Dev/_WhiteBoxing variants \u2014 both referenced from the same profile TU (0x3b3b337 / 0x3b3aff0)",
+    "evidence": "bg3q str output plus vtable-adjacent data pointers 0x193afaa 'controller_Dev.json', 0x1a9623c 'keyboard_Dev.json'"
+   },
+   {
+    "addr": "0x7c31d28",
+    "what": "ecl::player_management::PlayerIdToPlayerInputIndexMappingSingletonComponent TypeId static (ComponentTypeIdContext; Unchecked at 0x7b7ac10) \u2014 players are bound to input indices, relevant for making the virtual pad drive player 1",
+    "evidence": "bg3q comp output; 14 anonymous code sites reference the TypeId (bg3q to 0x07c31d28)"
+   },
+   {
+    "addr": "0x5315577",
+    "what": "Wwise AkMotionSink::Init also opens controllers \u2014 for rumble only, not input",
+    "evidence": "SDL_GameControllerOpen xref resolves inside named symbol AkMotionSink::Init(...) +0x57"
+   }
+  ],
+  "hook_points": [
+   {
+    "where": "LD_PRELOAD shim over the ~15 PLT-imported SDL controller functions + SDL_PollEvent",
+    "how": "All controller access goes through imports: SDL_PollEvent, SDL_NumJoysticks, SDL_IsGameController, SDL_GameControllerOpen/GetJoystick/GetType/GetSerial/GetPlayerIndex/HasLED/HasRumble/SetLED/Rumble/Close, SDL_JoystickInstanceID/GetPlayerIndex. Interpose them to present one fake pad (return a magic non-NULL handle, stable instance id) and append synthetic SDL_CONTROLLERDEVICEADDED + SDL_CONTROLLERAXISMOTION events to the PollEvent stream, with the left stick driven from WASD key state (which the shim sees for free in the same PollEvent stream). The game never polls axis state (no GetAxis/Update imports), so events are sufficient. Deadzone read from [[base+0x7D9D198]+0xa0] is bypassed by sending full deflection.",
+    "risk": "Steam overlay also interposes SDL; symbol-resolution ordering must be tested under the Steam runtime (pressure-vessel). Fake handle must survive being passed back to SetLED/Rumble.",
+    "confidence": "high"
+   },
+   {
+    "where": "Kernel uinput virtual gamepad (no interposition)",
+    "how": "Create an evdev device mimicking an Xbox pad (known VID/PID so libSDL2's built-in mapping DB accepts it, or set SDL_GAMECONTROLLERCONFIG env); a separate process translates X11/evdev WASD into stick events. The game's DEVICEADDED handler (0x2e9eade) hotplug-opens it automatically.",
+    "risk": "UNSHIPPABLE ALONE: every stick deflection queues deviceType>=3 events that reach the arbiter and trigger the full controller-UI theme reload (0x5f16fc0 LoadApplicationResources DefaultTheme_c.xaml), and the next mouse event reloads the KBM theme \u2014 heavyweight thrash. Also needs uinput permissions (udev rule) and leaks input to other apps. Only viable combined with the mode-freeze poke below.",
+    "confidence": "high"
+   },
+   {
+    "where": "Mode-freeze poke: [[base+0x7D5C040]+0x221] |= 1 (and/or +0x222)",
+    "how": "From an in-process shim, resolve the module base (dl_iterate_phdr), read the config-object pointer at base+0x7D5C040, set bit 0 of byte +0x221 or +0x222. All four mode-switch paths (0x500c770, 0x5a42550, and both startup branches) early-return when either bit is set \u2014 the KBM UI stays loaded while the virtual pad keeps sending events.",
+    "risk": "The two bytes are (isSet,value) fields of two UNNAMED config options (written by deserializer 0x2ff3ed0); freezing may have other semantics (e.g., it also suppresses legitimate mode changes the user wants), and offsets 0x221/0x222 + 0x7D5C040 are patch-version-specific. Decisive unknown: whether gameplay still consumes stick->CharacterMove* actions while mode stays KBM \u2014 needs one runtime test.",
+    "confidence": "medium"
+   },
+   {
+    "where": "Vtable patch of the arbiter slot (0x78c4768 primary +0x340 / 0x78c47b8 secondary +0x30, both in .data.rel.ro)",
+    "how": "mprotect the page and replace the InputModeArbiter pointer (0x500c4f0 / thunk 0x500c4e0) with a filter that drops deviceType>=3 transitions but passes KBM ones \u2014 surgical suppression of pad-induced UI switching only.",
+    "risk": "Hard-coded addresses break every patch; .data.rel.ro is shared-relro so mprotect needed; the arbiter's exact dispatch site was never observed, so semantics of the two extra bool args are inferred from disassembly only.",
+    "confidence": "medium"
+   },
+   {
+    "where": "Data-only: bind WASD to the internal CharacterMove* actions in PlayerProfiles/Eoc/keyboard_1.json",
+    "how": "CharacterMoveForward/Backward/Left/Right are registered actions (ids 0x9d-0xa0 region, GUIDs in .data.rel.ro e.g. 0x79EBB60) in the same raw-input id space as keyboard keys (LeftStickX=0x8a etc. in one enum); bindings are per-mode JSON profiles. If the profile parser accepts keyboard raw inputs for these '- internal' actions, WASD works with ZERO code and no gamepad at all \u2014 the Windows WASD mods reportedly work this way (docs-knowledge, not binary-verified).",
+    "risk": "Actions are digital on/off when key-driven (analog magnitude fixed), and the registration flags (edx=0x20 vs 0x10, ecx category 4) may encode a device-class restriction the parser enforces \u2014 unverified. Also unknown whether KBM-mode gameplay consumes these actions (same open question as above).",
+    "confidence": "low"
+   },
+   {
+    "where": "Command-line and bindable-action knobs for experiments",
+    "how": "'-startInControllerMode' / '-startInKeyboardMode' (parsed at 0x335a692/0x335a8a7) force the initial mode; input action 'ToggleInputMode' (id 0xc0, registered 0x4147972) can be bound to flip modes manually \u2014 useful instrumentation for the runtime tests, not a shipping mechanism.",
+    "risk": "None; observation-only knobs.",
+    "confidence": "high"
+   }
+  ],
+  "negative_results": [
+   "The game NEVER polls controller state: SDL_GameControllerGetAxis, GetButton, GameControllerUpdate, JoystickUpdate, GameControllerAddMapping, JoystickOpen are all ABSENT from the 71 SDL imports. A shim that only fakes state-query functions would do nothing; synthetic SDL events through SDL_PollEvent are mandatory (and sufficient).",
+   "There is no hidden mode-switching code: exhaustive E8/E9 rel32 byte-scan of all of .text found exactly 3 callers of SwitchToController (0x500bec0) and 2 of SwitchToKBM (0x500c270), all accounted for (startup parsing, Steam Deck default, and the single arbiter chain). The reloc graph plus byte-scan agree \u2014 the runtime switch surface is one arbiter.",
+   "No user-facing 'disable input-mode auto-switching' option string exists: searched Gamepad/Controller/InputMode/Switch/AutoDetect/DevicePreference string space; only '-startInControllerMode'/'-startInKeyboardMode' and the internal 'ToggleInputMode' action were found. The suppression bytes at cfg+0x221/0x222 exist but their config-option names could not be located statically (name table is runtime-built in .bss at 0x7C161F8).",
+   "The controller UI is not a cosmetic overlay: mode change reloads the ENTIRE Noesis application resource set (DefaultTheme_c.xaml, DefaultThemeLibs_c.xaml, StateMachine_c.xaml and all Scaled*_c.xaml variants) via GUI::LoadApplicationResources at 0x5f16fc0 \u2014 there is no per-widget hybrid mode. 'KBM UI with pad-driven movement' can only be achieved by suppressing the mode switch, not by partial UI configuration.",
+   "eoc::controller:: ECS namespace (FloodComponent, LocomotionComponent, PhysicsComponent) is character locomotion control, NOT gamepad handling \u2014 do not target it for input work.",
+   "SDL_CONTROLLERDEVICEREMAPPED (0x655) is ignored (jump table sends it to poll-next), and 'gamecontrollerdb'/'SDL_CONTROLLER' config strings are absent \u2014 the game relies entirely on libSDL2's own mapping database, so a uinput device must present a controller SDL already knows (or the user sets SDL_GAMECONTROLLERCONFIG, which libSDL2 reads itself)."
+  ],
+  "open_questions": [
+   "THE deciding question: with the UI mode pinned to KBM (via the cfg+0x221/0x222 guard bytes), does gameplay still consume controller-bound actions so the stick moves the character? The pump queues pad events unconditionally and both binding profiles (keyboard_1.json + controller_1.json) appear to load from one profile TU regardless of mode, but the consumption gate in ecl character-control code was not traced statically. One runtime session with a real pad + the byte poke answers this.",
+   "Is the arbiter invoked for AXIS events or only BUTTON events? Its virtual dispatch site was never pinned (vtable slot +0x340/+0x30 scans hit only FreeType false positives). If stick motion alone does not trigger the mode switch, a buttonless virtual left stick might not thrash the UI even without the freeze poke \u2014 cheap to test.",
+   "What are the names/semantics of the two config options whose bytes live at cfg+0x220..0x223 (value,isSet pairs)? They are parsed by the deserializer at 0x2ff3ed0 from a runtime-built option table (.bss 0x7C161F8); if one is a real user-facing setting, mode-freezing might be achievable via config file instead of a memory poke.",
+   "Does the keyboard_1.json binding parser accept raw keyboard inputs for the '- internal' CharacterMove* actions (and does the edx=0x10/0x20 registration flag encode a device-class restriction)? If yes, the entire virtual-gamepad apparatus is unnecessary for WASD.",
+   "How does single-player player-to-input-index assignment treat a second device (virtual pad alongside KBM)? ecl::player_management::PlayerIdToPlayerInputIndexMappingSingletonComponent (TypeId static 0x7c31d28) has 14 consumer sites that were not analyzed; couch-co-op logic could conceivably assign the new pad to a second player slot instead of player 1.",
+   "Does the guard at arbiter 0x500c60a (current screen id vs globals 0x7BB22C8/0x7BB22CC suppresses switching) indicate screens where mode is already locked (e.g., rebinding dialog)? Identifying those screen ids would clarify Larian's own mode-locking precedent."
+  ]
+ },
+ {
+  "claim": "LD_PRELOAD .so interposing SDL_PollEvent (single game call site 0x02e9e7c8, R_X86_64_PLT32) is a viable zero-patch hook point for a WASD mod, using a bg3se-style userspace synthetic-event queue; the game does not cache the function pointer and does not import SDL_PushEvent.",
+  "refuted": false,
+  "reasoning": "Core claim CONFIRMED at the ELF level, with independent re-derivation. (1) SDL_PollEvent is an UND FUNC in .dynsym; readelf -rW over the ENTIRE binary shows exactly two relocations against it: the R_X86_64_JUMP_SLOT at GOT 0x7b61840 (normal PLT machinery) and one R_X86_64_PLT32 code site at 0x2e9e7c8 \u2014 no R_X86_64_GOTPCREL/GLOB_DAT anywhere, so the game never takes the function's address into a data pointer; the 'may cache' risk is definitively absent. (2) Disassembly at the site: 0x2e9e7c2 'lea rdi,[rsp+0x68]'; 0x2e9e7c7 'call SDL_PollEvent'; 'test eax,eax; je' \u2014 a while(SDL_PollEvent(&ev)) pump with a switch on event type (cmp 0x603 / range 0x650-0x655 = SDL_CONTROLLERAXISMOTION family), i.e. this one loop consumes both keyboard and controller events. (3) SDL_PushEvent is absent from .dynsym; so are SDL_PumpEvents, SDL_PeepEvents, SDL_WaitEvent(Timeout), SDL_AddEventWatch, SDL_SetEventFilter, SDL_GetKeyboardState, SDL_GetModState, SDL_GameControllerGetAxis/GetButton (71 SDL imports total). All key/controller input is therefore event-driven through this single pump \u2014 injected synthetic events reach the same consumer as real ones. (Only mouse position is polled, via imported SDL_GetGlobalMouseState \u2014 irrelevant to WASD.) (4) Interposition mechanics hold: libSDL2.so is DT_NEEDED with RUNPATH $ORIGIN; .gnu.version_r has version needs only for glibc libs (SDL symbols unversioned); LD_PRELOAD objects precede DT_NEEDED/RUNPATH libs in lookup order. The game imports dlopen/dlsym but the string literals 'SDL_PollEvent' and 'libSDL2' occur ZERO times in the binary, ruling out any runtime dlsym path to SDL \u2014 the PLT call is the game's only route. (5) Supporting addresses all verified: GetInputValue at 0x2d1d880 (my own e8-rel32 scan of .text reproduces exactly 58 call sites, including 0x2c75ce4/cf8/d0c/d20 and 0x2c82c05/c1d/c35); 0x2c75cd0 reads commands 0xa0/0x9f/0x9d/0x9e and merges via insertps at 0x2c75d2a; 0x2c82bf0 region reads 0x66/0x65/0x64 (plus 0x63 at 0x2c82c4d \u2014 the 4th camera command, matching guide.md's '4 times'); registration at 0x4146530: 'mov dword ptr [r14],0x9d' at 0x414654a then lea \u2192 str 'CharacterMoveForward' (reloc site 0x4146560); 0x290a850 region has the cmove-selected 0x9d/0x9e/0x9f vs 0x68/0x69/0x6c alternates; inputremap_p1..p4.json used at 0x3b3b1f4/0x3b3b229/0x3b3b261/0x3b3b299; 'LoadWarnings' single site 0x320c4db; GUID d65cf1b6-... at 0x40905cd; build string '4.1.1.7398727' at 0x199b5bb with 6 use sites; .L__FUNCTION__._ZN3ecl9EocClient11HandleError... exists (0x1a33642) with single ref at 0x5a41fda; counts 206 .L__FUNCTION__ / 11375 .L__PRETTY_FUNCTION__ / 47 ecl-esv-eoc-scoped all match. ERRORS FOUND (supporting context only, do not affect the hook): (a) The claim that SDL_GetWindowGrab is called at 0x02e9f06f AND 0x02e9f9e7 is FALSE \u2014 the entire binary contains exactly one SDL_GetWindowGrab call site (0x2e9f06f); the reloc at 0x2e9f9e7 is R_X86_64_PLT32 against SDL_WarpMouseInWindow (call instruction 0x2e9f9e6). The Windows 'called twice in PollInput' landmark does NOT carry over to Linux. (b) The rationale 'no SDL_PushEvent needed, which matters because the game does NOT import SDL_PushEvent' is overstated: the game's import set does not constrain the preloaded .so, which could itself resolve SDL_PushEvent from libSDL2.so via dlsym/RTLD_NEXT; the userspace queue is still the better design but the justification is not load-bearing. (c) 0x2c82bf0 and 0x290a850 are mid-function labels, not function entries (0x2c82bf0 begins with a bare jne; 0x290a850 disassembles misaligned until 0x290a859) \u2014 the claimed instruction content is present, but anyone hooking these as 'function' addresses would break; the proposal hooks SDL_PollEvent, so this is not fatal. External-repo assertions (bg3se SDL.cpp behavior, ahungry's LD_PRELOAD chaining line, Norbyte issue quotes, bg3se-macos PORTING.md) are not verifiable from the binary and were not counted for or against.",
+  "correction": "Core claim stands. Corrections to supporting details: SDL_GetWindowGrab has exactly ONE call site in the Linux binary (0x2e9f06f); the site at 0x2e9f9e7 calls SDL_WarpMouseInWindow, not SDL_GetWindowGrab \u2014 the Windows 'GetWindowGrab called twice' landmark does not survive into this build. Also, 0x2c82bf0 and 0x290a850 are basic-block addresses inside larger functions, not function entry points, and the absence of SDL_PushEvent from the game's imports would not actually prevent a preloaded .so from using SDL_PushEvent itself (it can resolve it from libSDL2.so directly); the userspace queue is preferable but not forced.",
+  "evidence_checked": [
+   "readelf -rW /project/uploads/bg3 | grep SDL_PollEvent -> exactly 2 relocs: JUMP_SLOT @ GOT 0x7b61840 and R_X86_64_PLT32 @ 0x2e9e7c8; no GOTPCREL/GLOB_DAT (no cached pointer)",
+   "bg3q.py dis 0x2e9e7a0 -> 0x2e9e7c2 lea rdi,[rsp+0x68]; 0x2e9e7c7 call SDL_PollEvent; test eax,eax; je -> while(SDL_PollEvent(&ev)) pump with event-type switch incl. 0x650 controller range",
+   "readelf --dyn-syms: 71 SDL_ imports; SDL_PushEvent, SDL_PumpEvents, SDL_PeepEvents, SDL_WaitEvent*, SDL_AddEventWatch, SDL_SetEventFilter, SDL_GetKeyboardState, SDL_GameControllerGetAxis all ABSENT; SDL_GetGlobalMouseState present (mouse polled, keys event-only)",
+   "readelf -d: DT_NEEDED libSDL2.so, RUNPATH $ORIGIN; .gnu.version_r versions only for glibc libs -> SDL symbols unversioned; LD_PRELOAD wins lookup order",
+   "bg3q.py str: 'SDL_PollEvent' and 'libSDL2' string literals occur 0 times -> no runtime dlsym path to SDL despite dlopen/dlsym being imported",
+   "independent e8-rel32 scan of .text via lief: exactly 58 call sites to 0x2d1d880 (GetInputValue), including all claimed sites",
+   "bg3q.py dis 0x2c75cd0 -> calls GetInputValue with esi=0xa0/0x9f/0x9d/0x9e at 0x2c75ce4/cf8/d0c/d20, insertps merge at 0x2c75d2a",
+   "bg3q.py dis 0x2c82bf0 -> esi=0x66/0x65/0x64 at 0x2c82c05/c1d/c35 plus 0x63 at 0x2c82c4d (4 camera commands, matches guide.md)",
+   "bg3q.py dis 0x4146530 -> mov dword ptr [r14],0x9d at 0x414654a then lea rax -> str 'CharacterMoveForward'",
+   "bg3q.py dis 0x290a850 -> r15d=0x9f/r12d=0x9d/r13d=0x9e with cmove alternates 0x6c/0x68/0x69 feeding GetInputValue calls at 0x290a896/8a8/8ba/8cc (note: 0x290a850 is mid-function, misaligned until 0x290a859)",
+   "bg3q.py str inputremap -> p1/p2/p3/p4.json used at 0x3b3b1f4/0x3b3b229/0x3b3b261/0x3b3b299",
+   "bg3q.py str LoadWarnings -> single site 0x320c4db; str d65cf1b6 -> 0x40905cd; str 4.1.1.7398727 -> string @ 0x199b5bb, 6 use sites",
+   "sqlite: .L__FUNCTION__._ZN3ecl9EocClient11HandleErrorERKN2ls16TranslatedStringEbS4_N3eoc18EMessageBoxLocalIdE @ 0x1a33642, single ref 0x5a41fda; counts 206 .L__FUNCTION__ / 11375 .L__PRETTY_FUNCTION__ / 47 ecl-esv-eoc scoped",
+   "REFUTED DETAIL: sqlite xrefs + readelf -> SDL_GetWindowGrab has ONE call site (0x2e9f06f); reloc @ 0x2e9f9e7 is against SDL_WarpMouseInWindow (call at 0x2e9f9e6), not SDL_GetWindowGrab"
+  ]
+ },
+ {
+  "dimension": "movement",
+  "summary": "BG3's direct-drive movement path exists and is fully client-side: a per-player controller object literally named \"MoveController\" (name string at 0x1b29d3c, vtable ~0x79f4580, virtual update at 0x2c72d80) polls four analog input actions (0x9d CharacterMoveForward, 0x9e Backward, 0x9f Left, 0xa0 Right) via the input manager, builds a signed 2D vector, applies deadzone/clamp, rotates it into world space by a camera quaternion, and writes it into eoc::controller::LocomotionComponent (132 bytes: magnitude@+0x00, normalized world dir@+0x04, raw world vector@+0x10, derived near-target point = charPos+dir@+0x5c, speed@+0x80). So there IS a desired-direction vector field \u2014 direct drive is NOT expressed as a pathfinding destination; only the derived near-target point plus a heading angle (eoc::steering::SyncComponent, a single float) are streamed to the server via eocnet::CharacterSteeringMessage (msg id 0x24). Click-to-move is a separate controller (\"MoveToController\") and separate server task machinery (MoveTask/OsirisSteerTask strings). ecl::MovementSystem, ecl::PathingSystem (whose update body 0x241da30 is the actual per-frame position integrator over {MovementComponent, PathingComponent, SteeringComponent, Transform, optional LocomotionComponent}), ecl::controller::{Flood,Physics}System consume the LocomotionComponent. The smallest state change that makes the controlled character walk this frame is 9 bytes: the debug/forced-input override inside the input-fetch function 0x2c75c60 \u2014 write a vec2 at [ [0x7d9d198] ]+0x1394 and set the byte at +0x139c, and the character walks in that (camera-relative) direction through the entire legitimate pipeline.",
+  "key_addresses": [
+   {
+    "addr": "0x2c72d80",
+    "what": "MoveController::update \u2014 the direct-drive writer; fetches input vector and writes eoc::controller::LocomotionComponent (+0x00 magnitude, +0x04 normalized dir, +0x10 raw vec via movlps [rbx+0x10]; final target point at +0x5c..0x64 = charPos+dir at 0x2c7480b/0x2c7484d)",
+    "evidence": "dis shows call 0x2c75920 (GetWritable<Locomotion>) then call 0x2c75c60, movlps [rbx+0x10],xmm0 / movss [rbx+0x18],xmm1, normalize, stores to [rax], [rax+4], [rax+0xc]; vtable slot 0x79f4658 -> 0x2c72d80 sits in a static whose tail (0x79f46b8) points at string \"MoveController\" (0x1b29d3c)"
+   },
+   {
+    "addr": "0x2c75c60",
+    "what": "GetMoveInputVector(playerId, flag): polls input actions 0xa0,0x9f,0x9d,0x9e, computes (Right-Left, Forward-Backward), deadzone+unit-clamp, then camera-quaternion-rotates to world space. Contains a debug override: if byte [g+0x139c]!=0 use vec2 at [g+0x1394] instead of polling, where g = *(void**)0x7d9d198",
+    "evidence": "dis: mov esi,0xa0/0x9f/0x9d/0x9e each followed by call 0x2d1d880; movsd xmm5,[rax+0x1394] guarded by cmp byte [rax+0x139c],0 with rax=[rip+0x5127527]=0x7d9d198; quat-rotate math after call 0x2194aa0"
+   },
+   {
+    "addr": "0x0414654a",
+    "what": "Input-action registration: CharacterMoveForward=0x9d, CharacterMoveBackward=0x9e (0x041465c8), CharacterMoveLeft=0x9f (0x04146646), CharacterMoveRight=0xa0 (next in sequence, and 0xa0 is the first id polled in 0x2c75c60)",
+    "evidence": "dis at 0x04146520: mov dword ptr [r14],0x9d + lea rax,[str 'CharacterMoveForward'] then same pattern for 0x9e/0x9f"
+   },
+   {
+    "addr": "0x07c3e290 / 0x07c47938",
+    "what": "ls::TypeId<eoc::controller::LocomotionComponent> m_TypeIndex statics (checked/unchecked contexts); component size = 0x84 (132) bytes",
+    "evidence": "GetComponent helper at 0x25afeb0 passes r8d=0x84; type-registration fn 0x04226d80 stores 0x840084; deferred-add record at 0x3cbf80e stamps word size 0x84 + typeindex"
+   },
+   {
+    "addr": "0x2c75920",
+    "what": "GetWritableComponent<LocomotionComponent> \u2014 fetch + atomic 'lock or' of per-type modified bit (this is what marks the component dirty so sync systems notice)",
+    "evidence": "dis at 0x2c759cd: typeindex load, r9d=0x84, call 0x2565a10, then lock or qword [rdx+r12*8],rsi"
+   },
+   {
+    "addr": "0x2d1d880",
+    "what": "InputManager::GetActionValue(actionId, playerInputIndex) \u2014 walks the action's raw-input bindings and reads 12-byte {float,float,u8} per-device value records; returns analog value",
+    "evidence": "dis: indexes [rdi+rcx*16+0x154] binding table, movsd xmm0,[rax+rdx*4] + mov r15b,[rax+rdx*4+8]; called 4x from 0x2c75c60. Input manager global ptr slot: 0x7d9d0a8; playerId->input-index map slot: 0x7d5c038"
+   },
+   {
+    "addr": "0x25a3b70",
+    "what": "on-locomotion-changed sender functor: copies vec3 from LocomotionComponent+0x5c into the per-entity steering sync record (record: vec3@0, hasLoco flag@0x14) and sends; functor ptr stored at 0x79e32f8",
+    "evidence": "dis: call 0x25b0e10 (get/create record), call 0x25afeb0 (GetLoco), mov rcx,[rax+0x5c]; mov [r15],rcx; mov eax,[rax+0x64]; mov [r15+8],eax; mov byte [r15+0x14],1"
+   },
+   {
+    "addr": "0x221a5a0",
+    "what": "ecl::steering::SyncSystem update body: eoc::steering::SyncComponent is ONE float per entity (heading angle); wraps angle, writes record angle@+0xC, 0.5f@+0x18, sends with change-dedup",
+    "evidence": "factory 0x04295b10 stores body ptr; dis: movss xmm0,[r13+r12*4] (4-byte stride component array), angle-wrap math, movss [rax+0xc],xmm2; mov dword [rax+0x18],0x3f000000"
+   },
+   {
+    "addr": "0x3ce02e2 / 0x7928fd8 / 0x2b04bd0",
+    "what": "eocnet::CharacterSteeringMessage: registered with id 0x24; object ctor 0x3ce8240; vtable 0x7928fd8; serializer 0x2b04bd0 writes count + 0x20-byte entries {u64 netId, u8 kind (kind==1 also serializes float@+0x18), length-prefixed payload blob via 0x2b04e40}",
+    "evidence": "registration dis at 0x3ce02b5-0x3ce0311 pairing str 'eocnet::CharacterSteeringMessage' with esi=0x24; ctor defaults entries to {-1,0,0,FLT_MAX}"
+   },
+   {
+    "addr": "0x241da30",
+    "what": "ecl::PathingSystem update body \u2014 the client-side per-frame position integrator: iterates Spec<{eoc::MovementComponent, eoc::PathingComponent, eoc::SteeringComponent, ls::LevelComponent, ls::TransformComponent}, optional {eoc::controller::LocomotionComponent, ls::VisualComponent}> (spec static 0x07bf87b0); quaternion math, path-segment lerp, sqrt/normalize",
+    "evidence": "factory 0x03d9aa00 (loads ecl::PathingSystem SystemsContext, stores body ptr lea rax,[rip-0x197d094]); body references the spec at 0x0241dd0e and is dense with mulss/sqrtss/divss"
+   },
+   {
+    "addr": "0x4614f00",
+    "what": "ecl::MovementSystem factory: declares write {eoc::MovementComponent}, read {ecl::Character, TemplateChangedEvent, eoc::controller::LocomotionComponent, GameObjectVisual, gamestate::Running, Level}; update body 0x223ae90 (lifecycle: attaches MovementComponent)",
+    "evidence": "dis at 0x04614ff0-0x046150c1 building the two access lists with those typeids"
+   },
+   {
+    "addr": "0x464b770 / 0x21f1e00",
+    "what": "ecl::steering::SSSteerSystem factory/body: writes {ecl::steering::SSSteerComponent (16 bytes), eoc::SteeringComponent}; body attaches SSSteerComponent to steering characters",
+    "evidence": "factory declares 2-entry write set; body stamps 'mov word [rbx+0x1c],0x10' + SSSteer typeindex on the deferred-add record"
+   },
+   {
+    "addr": "0x43d1710 / 0x43cfdb0",
+    "what": "ecl::controller::PhysicsSystem / FloodSystem factories \u2014 the direct-drive support systems: PhysicsSystem writes eoc::controller::PhysicsComponent, reads {Bound, Character, controller::FloodComponent, controller::LocomotionComponent, party::Member/View, Transform}",
+    "evidence": "dis of factory access-set at 0x43d174a-0x43d181a"
+   },
+   {
+    "addr": "0x1a53ae6 / 0x1b66638 / 0x1a35dd9",
+    "what": "server task names 'OsirisSteerTask'/'MoveTask' and client controller enum 'MoveToController' \u2014 the separate click-to-move/destination path",
+    "evidence": "bg3q str output; 'MoveToController' registered in a Noesis TypeEnum at 0x0407d228 in the same enum table as other controller kinds"
+   }
+  ],
+  "hook_points": [
+   {
+    "where": "Forced-move-input override global: g = *(void**)(base+0x7d9d198); write vec2 floats at g+0x1394 and set byte g+0x139c = 1",
+    "how": "Smallest possible state change (9 bytes, no code patching): the input-fetch 0x2c75c60 checks this every frame before polling SDL-backed actions; the injected vec2 flows through the identical deadzone/normalize/camera-rotate/Locomotion/netsync pipeline, so the controlled character walks with full animation, collision (controller::PhysicsSystem) and server sync",
+    "risk": "Only affects the currently-controlled character of the local player; vector is camera-relative (pre-rotation), so world-direction requires compensating by camera yaw; the global's exact owning object is anonymous \u2014 the +0x1394/+0x139c offsets could shift between patches",
+    "confidence": "high"
+   },
+   {
+    "where": "eoc::controller::LocomotionComponent direct write (live type index in the 4-byte static at 0x07c3e290; component size 0x84)",
+    "how": "For an entity that already has the component, write magnitude@+0x00, normalized world-space dir@+0x04..0x0C, raw vec@+0x10..0x18 each frame AFTER MoveController runs (it overwrites for the controlled char), or use the writable-getter 0x2c75920 which also sets the ECS modified bit so the steering sync/net layer picks it up",
+    "risk": "MoveController::update (0x2c72d80) overwrites these fields every frame for the active character \u2014 hook ordering matters; for arbitrary NPC entities the component must first be added (deferred-add record pattern seen at 0x3cbf7e0, size 0x84 + typeindex) and server acceptance of steering messages for non-owned entities is unverified",
+    "confidence": "high"
+   },
+   {
+    "where": "MoveController::update vtable slot at 0x79f4658 (points to 0x2c72d80)",
+    "how": "mprotect the relro page and swap the pointer, or inline-hook 0x2c72d80; gives complete control of the direct-drive path including the flood/physics gating, with the player-context object (entity handle at [this+0x68]+0x10, player id at +0x12c) handed to you",
+    "risk": "Function is ~10KB with heavy inlining; its this-layout is only partially mapped; relro patching needed; slot index may shift when Larian adds virtuals",
+    "confidence": "medium"
+   },
+   {
+    "where": "InputManager::GetActionValue at 0x2d1d880 (input manager instance at *(void**)0x7d9d0a8), action ids 0x9d-0xa0",
+    "how": "Hook the getter and return synthetic analog values for the four CharacterMove* actions (works for keyboard-WASD and gamepad identically since both feed the same action ids), or write the 12-byte {float,float,u8} records in the backing per-device value tables it reads",
+    "risk": "Hook is hot (called for every polled action, not just movement); backing-table layout ({float,float,u8} stride 12) was read from one code path only",
+    "confidence": "medium"
+   },
+   {
+    "where": "NETMSG_CHARACTER_STEERING (eocnet msg id 0x24, serializer 0x2b04bd0) and the pending-record allocator 0x25b0e10",
+    "how": "Forge/modify steering records (vec3 target@0, heading angle@0xC, hasLoco@0x14, speed-factor@0x18) before the send in 0x221a5a0/0x25a3b70 to steer any client-owned character server-side without touching input at all",
+    "risk": "Payload blob layout inside 0x2b04e40 is length-prefixed and only partially decoded; server-side validation (esv::steering::StateSystem) not reversed \u2014 unknown whether it rejects targets for entities the client does not own",
+    "confidence": "medium"
+   },
+   {
+    "where": "ecl::PathingSystem integrator body 0x241da30 (query spec static 0x07bf87b0)",
+    "how": "Hook to intercept every client-side position update of every moving character (read/modify position, speed, path progress) \u2014 the choke point where paths and steering become Transform changes",
+    "risk": "This system integrates server-driven paths; changes here desync from the server (position is reconciled via DeadReckoning/NETMSG_CHARACTER_UPDATE_* which we did not fully map); function is very large and lambda-structured",
+    "confidence": "medium"
+   }
+  ],
+  "negative_results": [
+   "There is NO ECS input-vector singleton and NO 'MovementInputComponent': the desired-direction vector lives only in eoc::controller::LocomotionComponent, written imperatively by the MoveController class (not by a declared ECS system).",
+   "Direct-drive controller movement is NOT converted into click-to-move pathfinding requests: MoveController's update contains no pathfinding query usage \u2014 it performs flood/physics checks and writes a direction + derived near-target point; the destination-point machinery (MoveToController, MoveTask/OsirisSteerTask) is a completely separate path.",
+   "eoc::steering::SyncComponent is a single float (heading angle, 4-byte component stride verified in 0x221a5a0) \u2014 'steering' in Larian's vocabulary means facing/turning, not the movement vector.",
+   "No network message carries the raw stick vector: NETMSG_CHARACTER_STEERING carries a heading angle plus a derived world-space near-target vec3 (Locomotion+0x5c), with change-dedup; there is no per-frame 'input state' packet.",
+   "No reflection/property-name strings exist for eoc::/ecl:: movement components ('bg3q str' for component names returns nothing) \u2014 field layouts must come from code, as done here.",
+   "The 'CharacterMove' string in the Noesis enum at 0x0407d45f is a UI cursor/interaction enum value, not the movement input action \u2014 a false lead.",
+   "The ECS system Update() virtual (e.g. MovementSystem vtable slot 3 = 0x4d02a00) only enqueues a job; the real per-frame work function is the raw function pointer stored by each system factory (e.g. 0x223ae90, 0x241da30, 0x21f1e00, 0x221a5a0) \u2014 hooking the vtable Update of a system gives you scheduling, not logic."
+  ],
+  "open_questions": [
+   "Field semantics of eoc::MovementComponent itself (speed/acceleration values consumed by ecl::PathingSystem) were not mapped \u2014 the integrator reads it but the specific offsets were not isolated in this pass.",
+   "Which dispatcher invokes MoveController::update each frame (the per-player input-controller stack \u2014 InputController/GameplayController strings at 0x64bc6d3/0x64c1b33 \u2014 was not traced), and the full this-layout of MoveController ([this+0x68] context object).",
+   "Server-side consumption of NETMSG_CHARACTER_STEERING: esv::steering::StateSystem's factory (0x45cd43e) reads {SteeringComponent, steering::SyncComponent} but the handler that turns the received record into server movement, and its ownership/anticheat validation, is unmapped.",
+   "Whether NETMSG_CHARACTER_UPDATE_SERVER streams client-authoritative positions for the directly-driven character (name plus esv::DeadReckoningSystem strongly suggest it) \u2014 unverified.",
+   "CharacterMoveRight = 0xa0 is inferred from registration sequence (0x9d/0x9e/0x9f explicit) and from 0x2c75c60 polling 0xa0 first in a Right-minus-Left subtraction \u2014 near-certain but the explicit registration instruction for 0xa0 was not captured.",
+   "What the LocomotionComponent fields +0x68 (smoothed vec3) and +0x74 (accel-blended vec3) feed exactly, and the role of eoc::controller::FloodComponent's flood-fill data in constraining direct movement (FloodSystem factory found at 0x43cfdb0 but its body was not reversed)."
+  ]
+ },
+ {
+  "dimension": "hooking \u2014 the Linux hooking substrate for a BG3 native-ELF extender",
+  "summary": "The binary is about as friendly a target as a 214 MB PIE gets: zero Intel CET (0 endbr64 in all 90.1 MB of .text, no .note.gnu.property), classic lazy PLT with a writable .got.plt outside GNU_RELRO, no BIND_NOW, and no anti-tamper whatsoever \u2014 every ptrace/prctl call site in the file belongs to crashpad, and the one TracerPid check in main() exists to *disable* the crash reporter under a debugger. Load bias is trivial because the first PT_LOAD has p_vaddr 0, so live = base + static_addr; I verified dl_iterate_phdr, getauxval(AT_PHDR) and /proc/self/maps all return the identical bias. .symtab/.strtab/.rela.text all sit past the end of every PT_LOAD (highest mapped file offset 0x7b5ff08; .symtab starts at 0xc7ec8a8), so dlsym can never see Larian internals \u2014 but preading 13.9 MB of symtab+strtab from /proc/self/exe and resolving arbitrary needles takes 27 ms, which is free. The executable exports only 4 dynamic symbols, so LD_PRELOAD cannot interpose any game function (I proved empirically that an exe-defined symbol beats a preload, which kills pthread_create interposition specifically); inline hooking with a 5-byte rel32 into a near \"island\" is required, and I built and ran a working end-to-end preload that resolves an unexported .symtab symbol, allocates a trampoline within \u00b12 GB, and diverts the function. The biggest non-obvious findings: our handler in the .so lands ~26 TB away from the game's .text so a bare rel32 always overflows and a 14-byte absolute jump island is mandatory; the game fork()s at main+0x32f and runs as a *child* under a waitpid supervisor unless --no-crash-reporter is passed or a debugger is attached; and libOsiris.so is a DT_NEEDED with RUNPATH $ORIGIN, so a drop-in shim library (proven working) gives us load-without-LD_PRELOAD plus free interposition of all 32 COsiris PLT imports.",
+  "key_addresses": [
+   {
+    "addr": "0x0 (first PT_LOAD p_vaddr)",
+    "what": "Load-bias identity: runtime_addr = mapping_base + static_addr, no adjustment",
+    "evidence": "readelf -lW: `LOAD 0x000000 0x0000000000000000 ... 0x218adfc R`. Because the first PT_LOAD has p_vaddr 0, the ELF load bias equals the lowest mapping address. My preload printed `bias dl_iterate_phdr=0x5d08bf6db000 auxv(AT_PHDR)=0x5d08bf6db000 /proc/self/maps=0x5d08bf6db000 ALL AGREE`."
+   },
+   {
+    "addr": "0x218be00 (.text, size 0x565c316, file off 0x218ae00)",
+    "what": "The 90.1 MB RX code segment \u2014 every inline hook target lives here",
+    "evidence": "readelf -SW: `[15] .text PROGBITS 000000000218be00 218ae00 565c316 00 AX`. Segment 03 is `.text .init .fini .plt`, flags R E (readelf -lW shows `LOAD 0x218ae00 0x218be00 ... R E`). Note the 0x1000 file-offset/vaddr skew."
+   },
+   {
+    "addr": "file offset 0xc7ec8a8 (.symtab), 0xcb69b13 (.strtab), 0x7b5ff08 (.rela.text)",
+    "what": "NOT loaded into memory \u2014 dlsym/dl_iterate can never see them; must be read from /proc/self/exe",
+    "evidence": "I enumerated the PT_LOAD file ranges programmatically: highest mapped file offset = 0x7b5ff08. Output: `.symtab: file 0xc7ec8a8-0xcb699a8 inside a PT_LOAD? False`, `.strtab ... False`, `.rela.text: file 0x7b5ff08-0xbfbc138 ... False`. sh_addr is 0 for all three (no SHF_ALLOC). 152,416 symbols, 3.49 MB symtab + 10.37 MB strtab."
+   },
+   {
+    "addr": "0x3357fc0 (pthread_create, size 150)",
+    "what": "The ONLY exported FUNC in .dynsym \u2014 the game interposes pthread_create itself, and it is therefore NOT LD_PRELOAD-interposable",
+    "evidence": "`readelf --dyn-syms` shows only 4 defined entries out of 823: `819: 0000000003357fc0 150 FUNC GLOBAL DEFAULT 15 pthread_create`, plus _edata/__bss_start/_end. Disassembly at 0x3357fc0 shows it operator-new's a {fn,arg} pair, substitutes its own entry thunk (rip+0x1e09d7f \u2192 0x5161d70) and tail-calls a function pointer in .bss at 0x7b62fd0 (the dlsym'd real pthread_create). I confirmed the shadowing rule empirically with a 3-file repro: an exe-defined `shared_hook` was called even with LD_PRELOAD supplying its own."
+   },
+   {
+    "addr": "0x7b615b0\u20130x7b62f08 (.got.plt)",
+    "what": "Writable at runtime \u2014 GOT hooking of any of the 808 PLT imports needs NO mprotect",
+    "evidence": "GNU_RELRO spans 0x77ec3d0\u20130x7af8000 (vaddr + memsz 0x30bc30). I computed containment: `.got 0x7af6ee8-0x7af7128 inside RELRO? True`, `.got.plt 0x7b615b0-0x7b62f08 inside RELRO? False`. Dynamic section has no DT_BIND_NOW and FLAGS_1 is `PIE` only \u2192 lazy binding, classic PLT (.plt[0] = `ff 35 .. / ff 25 ..`, entries = `ff 25 <got> / 68 <idx> / e9 <plt0>`)."
+   },
+   {
+    "addr": "0x77e8640 (SDL_PollEvent PLT stub) / 0x7b61840 (its GOT slot) / 0x2e9e7c7 (the sole call site)",
+    "what": "The per-frame input pump \u2014 one call site, reached through the PLT, so LD_PRELOAD interposes it for free",
+    "evidence": "`readelf -rW` gives exactly two relocs: `0000000007b61840 ... R_X86_64_JUMP_SLOT SDL_PollEvent` and `0000000002e9e7c8 ... R_X86_64_PLT32 SDL_PollEvent - 4`. Disassembly: `0x02e9e7c2 lea rdi,[rsp+0x68]; 0x02e9e7c7 call 0x77e8640 ; SDL_PollEvent; 0x02e9e7cc test eax,eax; 0x02e9e7ce je 0x2e9eff8` \u2014 a `while(SDL_PollEvent(&ev))` drain loop with a jump table on event type (`cmp eax,0x603`, `lea ecx,[rax-0x650]`). 71 SDL_* imports total, all PLT \u2014 no -fno-plt anywhere."
+   },
+   {
+    "addr": "0x5a0a2d0 (main, size 0x992)",
+    "what": "main() from /LSProjects/Apps/Gustav/Code/EoCApp/Linux/main.cpp \u2014 contains the debugger check, the crash-reporter opt-out and the fork",
+    "evidence": "symtab: `main` FUNC addr 94413520 (0x5a0a2d0) size 2450. `bg3q.py from 0x5a0a2d0` shows it referencing '/proc/self/exe', 'SteamDeck', '/etc/machine-id', '--no-crash-reporter', fork, EVP_sha256/HMAC, and '/LSProjects/Apps/Gustav/Code/EoCApp/Linux/main.cpp'."
+   },
+   {
+    "addr": "0x3812840 (anonymous IsDebuggerPresent)",
+    "what": "Reads /proc/self/status, strstr \"TracerPid:\\t\", returns byte[+11] != '0'. Exactly 2 callers. NOT anti-debug.",
+    "evidence": "Disassembly 0x3812840-0x38128a9: open64('/proc/self/status') \u2192 read(0x400) \u2192 close \u2192 strstr('TracerPid:\\t') \u2192 `cmp byte ptr [rax+0xb], 0x30 / setne bl`. I byte-scanned .text for `E8/E9 rel32 \u2192 0x3812840`: exactly 2 sites, 0x3812976 and 0x5a0a462."
+   },
+   {
+    "addr": "0x5a0a462 \u2192 je 0x5a0a5d2",
+    "what": "main's debugger gate: if a debugger is attached, the game SKIPS fork() and all crashpad wiring",
+    "evidence": "`0x05a0a462 call 0x3812840 / 0x05a0a467 test al,al / 0x05a0a469 je 0x5a0a5d2 / 0x05a0a46f xorps xmm0,xmm0 ... '/etc/machine-id'`. al!=0 (debugged) falls through to 0x5a0a46f; al==0 branches to the argv scan + fork."
+   },
+   {
+    "addr": "0x5a0a5ea (strcmp) with string '--no-crash-reporter' at 0x19d52e2",
+    "what": "Command-line switch that bypasses fork(), crashpad StartHandler and LinuxCrashReporter entirely",
+    "evidence": "`0x05a0a5dc lea r15,[rip-0x4035301] ; str '--no-crash-reporter' / 0x05a0a5ea call strcmp / 0x05a0a5f1 je 0x5a0a46f`. I ran a capstone CFG reachability pass over main: from entry, both `fork` (0x5a0a5ff) and the crashpad `%s/handler` block (0x5a0a9cc) are reachable; from the --no-crash-reporter target 0x5a0a46f, `reaches fork(): False`, `reaches crashpad handler: False`."
+   },
+   {
+    "addr": "0x5a0a5ff (fork) / 0x5a0ab41 (waitpid) / 0x5a0a962 (child branch)",
+    "what": "By default the game runs as a forked CHILD; the parent is a waitpid supervisor that launches LinuxCrashReporter on abnormal exit",
+    "evidence": "`0x05a0a5ff call fork / 0x05a0a604 test eax,eax / jns 0x5a0a95c`; at 0x5a0a95c `jne 0x5a0ab2f` (parent) else fall through to `usleep(0x7530)` + the crashpad handler path. Parent branch 0x5a0ab2f: `call waitpid` then WIFSIGNALED decoding (`and ecx,0x7f; shl ecx,0x18; add 0x1000000; cmp 0x2000000`), error string '%s:%d: waitpid() failed with error \"%d\".\\n' at main.cpp:409."
+   },
+   {
+    "addr": "0x5a0a9cc ('%s/handler' at 0x1a5a1bc) \u2192 0x3f23cc0 (crashpad::CrashpadClient::StartHandler)",
+    "what": "crashpad out-of-process handler startup: handler binary at <gamedir>/handler, database at <gamedir>/../db",
+    "evidence": "`0x05a0a9cc lea rdx,[rip-0x3fb0817] ; str '%s/handler'` after `lea rsi,[rip-0x405a7ea] ; str '/../db'` at 0x5a0a979. Strings 'failed to initialize crashpad database' (0x1b0ee96) and 'failed to start crashpad client' (0x19b0275) are used at 0x3f233b7/0x3f233f4."
+   },
+   {
+    "addr": "0x515c010 (crashpad::Signals::InstallCrashHandlers), single caller 0x515842b",
+    "what": "The one place crash signal handlers are installed \u2014 sigaction with flags 0x8000800 (SA_ONSTACK set), handler at 0x5158c60",
+    "evidence": "`bg3q.py to 0x515c010` \u2192 `[1 references] 0x0515842b`. Disassembly: `0x05158418 lea rdi,[rip+0x841]` (=0x5158c60) `/ mov esi,0x8000800 / call 0x515c010`. Preceded by `call 0x5158520 ; CrashpadClient::InitializeSignalStackForThread()`. All 9 ptrace call sites and all 6 prctl call sites in the entire binary are inside crashpad (Ptracer::GetThreadInfo/ReadUpTo, PtraceAttach/Detach, ScopedPrSetDumpable)."
+   },
+   {
+    "addr": "0x5a0ac70, string '%s/LinuxCrashReporter' at 0x19881df",
+    "what": "Larian's own reporter launcher: fork + execve, and it force-sets VK_LOADER_LAYERS_DISABLE=VK_LAYER_VALVE_steam_overlay in the child env",
+    "evidence": "Function starts at 0x5a0ac70 (immediately after main's int3 padding). `bg3q.py from 0x5a0aca6` shows '%s/LinuxCrashReporter', '--pid=%ld', '--log-directory=%s', '--argv=', 'VK_LOADER_LAYERS_DISABLE=VK_LAYER_VALVE_steam_overlay,VK_LAYER_VALVE_steam_overl\u2026', then fork \u2192 execve \u2192 _Exit."
+   },
+   {
+    "addr": "0x5a3b338 (SteamAPI_RestartAppIfNecessary), 0x5a3b345 (SteamAPI_Init)",
+    "what": "Steam relaunch guard with AppID 1086940 \u2014 launching the ELF bare will bounce through Steam",
+    "evidence": "`0x05a3b32a mov edi,0x1095dc` (=1086940 decimal) `/ 0x05a3b338 call 0x77e9280 ; SteamAPI_RestartAppIfNecessary / test al,al / jne 0x5a3c1d3`. Source file string '/LSProjects/Framework/Code/SteamBinding/SteamAPIManager.cpp' at 0x5a3b388. No 'steam_appid' string exists anywhere in the binary (bg3q.py str returned 0 hits)."
+   },
+   {
+    "addr": "0x7b62400\u20130x7b62520 (32 COsiris/COsiArgumentDesc JUMP_SLOTs)",
+    "what": "The whole Osiris script-VM API is a dynamic import from libOsiris.so \u2192 interposable with zero inline hooking",
+    "evidence": "`readelf -rW | grep JUMP_SLOT | grep COsiris` returns 32 entries including `COsiris::Event(unsigned int, COsiArgumentDesc*)` @0x7b62400, `COsiris::RegisterDIVFunctions(TOsirisInitFunction*)` @0x7b624e0, `COsiris::Compile(wchar_t const*, wchar_t const*)` @0x7b624f0, `COsiris::Load/Save/Merge/InitGame`. DT_NEEDED includes libOsiris.so and DT_RUNPATH is `$ORIGIN`."
+   },
+   {
+    "addr": "0x2454490 (operator new, 267 B) / 0x2397530 (operator delete, 285 B)",
+    "what": "The game's allocator is mimalloc \u2014 memory must never cross the heap boundary between our .so and the game",
+    "evidence": "Disassembly of 0x2454490: `cmp qword [rip+0x59489b4],0 / cmp byte [rip+0x5948aa2],0 / call malloc` (fallback path) else `mov rcx, qword ptr fs:[0xfffffffffffdb2e8] ; _mi_heap_default`. symtab has TLS symbol `_mi_heap_default` at TLS offset 0x18. TLS segment memsz is 0x24d21 (150 KB), dominated by the mimalloc per-thread heap. No mi_* FUNC symbols are named."
+   },
+   {
+    "addr": ".bss 0x7b6fed0\u20130x7d9b5a8",
+    "what": "All 13,772 ls::TypeId<\u2026>::m_TypeIndex statics live in .bss (shndx 29) \u2014 plain bias+addr reads at runtime",
+    "evidence": "Query on symbols where name LIKE '_ZN2ls6TypeId%m_TypeIndexE': count 13772, min addr 0x7b6fed0, max 0x7d9b5a8, all shndx=29; .bss is 0x7b62f40\u20130x7dd6195. Each is size 4."
+   },
+   {
+    "addr": "vaddr 0x31c (.note.gnu.build-id) \u2014 c8da62b137caebd03b57c23b65ba2547745ce851",
+    "what": "The correct version key for a precomputed offset table; it IS mapped in memory (unlike .symtab)",
+    "evidence": "readelf -SW: `[3] .note.gnu.build-id NOTE 000000000000031c 00031c 000024 00 A`. 0x31c < 0x218adfc so it is inside LOAD[0]. Version strings '4.1.1.7398727' (0x199b5bb) and 'GustavX' (0x1ad1823) also exist but are only reachable via anonymous code."
+   },
+   {
+    "addr": ".text section symbol id 151262, sh_addr 0x218be00 (xrefs table)",
+    "what": "How to reverse-xref an ANONYMOUS Larian function offline: addend = target_vaddr - 4 - 0x218be00",
+    "evidence": "1,956,343 of 2,986,688 xrefs point at an unnamed SECTION symbol. Testing the formula against the byte-scan ground truth for 0x3812840: `select site,rtype,addend from xrefs where dst=151262 and addend=0x1686a3c` \u2192 `[(94413923, 4, ...), (58796407, 4, ...)]` = 0x5A0A463 and 0x3812977, exactly the two E8 operand offsets I found by brute-force scanning. bg3q.py's `to` does not do this and returns garbage for such targets."
+   }
+  ],
+  "hook_points": [
+   {
+    "where": "Load-bias resolution, at .so constructor time",
+    "how": "Use dl_iterate_phdr and take the first callback whose dlpi_name[0]=='\\0' \u2192 dlpi_addr is the bias. Because the first PT_LOAD has p_vaddr 0, live = bias + static_addr with no further arithmetic. Fall back to getauxval(AT_PHDR) minus PT_PHDR's p_vaddr, or the first /proc/self/maps line whose path matches readlink(/proc/self/exe).",
+    "risk": "Essentially none. Do NOT use dladdr(&main) \u2014 main is a .symtab-only local and dladdr resolves via .dynsym. Do not assume /proc/self/maps line ordering if the loader ever splits the image; match by resolved path.",
+    "confidence": "high"
+   },
+   {
+    "where": "Unexported Larian/third-party symbol resolution, in the .so constructor",
+    "how": "open(\"/proc/self/exe\"), pread the section headers, find SHT_SYMTAB and its sh_link strtab, pread both (3.49 MB + 10.37 MB), single pass matching against a hash set of needles. Measured on this exact 213.8 MB file: pread 9.7 ms + one scan 16.9 ms = 27 ms total, and it is flat whether you resolve 500 or 3000 names. Building a full name\u2192value hash of all 152,400 named symbols instead costs 42 ms and 8 MB. Either is free relative to game load time.",
+    "risk": "This only reaches the 45k third-party/libc++/mimalloc symbols and a handful of globals \u2014 ~90% of .text is anonymous Larian code with no name at all. Also: if Larian ever ships a stripped build this path evaporates, so detect SHT_SYMTAB absence and degrade gracefully. Reading /proc/self/exe on Steam Deck cold-cache adds disk I/O for 13.9 MB.",
+    "confidence": "high"
+   },
+   {
+    "where": "Anonymous Larian functions (the interesting 90%)",
+    "how": "Ship a build-id-keyed offset table generated OFFLINE from bg3.db. Key it on the 20-byte .note.gnu.build-id at vaddr 0x31c (mapped, cheap to read). Generate targets by the reloc-graph method proven above: anchor on a distinctive .L.str, follow xrefs, and for anonymous callees query `xrefs where dst = <.text SECTION sym> and addend = target - 4 - 0x218be00`.",
+    "risk": "Offsets are hard-invalid on every patch; you must refuse to hook on build-id mismatch rather than crash. The reloc graph is only available offline (.rela.text is not mapped), so there is no runtime self-repair.",
+    "confidence": "high"
+   },
+   {
+    "where": "Runtime signature scanning (fallback for anonymous functions)",
+    "how": "memmem on a fixed byte prefix then verify the masked remainder, in ONE pass over .text for all patterns at once.",
+    "risk": "Measured on this binary: a 12-byte masked pattern over 90.1 MB costs 110 ms naive / 40 ms memmem-accelerated, and the SDL_PollEvent-loop pattern I tried was NOT unique \u2014 24 hits. Fifty patterns scanned independently would be 2-5 s of startup. Every pattern must be uniqueness-verified offline against this binary before shipping. Treat as last resort, not the primary mechanism.",
+    "confidence": "high"
+   },
+   {
+    "where": "Inline hooking of any game function \u2014 the core mechanism",
+    "how": "5-byte `E9 rel32` at the function entry, jumping to a 14-byte absolute-jump ISLAND (`FF 25 00 00 00 00` + `.quad handler`) allocated within \u00b12 GB of .text; the island then jumps to your handler in the .so. Trampoline = stolen bytes + `E9 rel32` back to entry+N, also placed in the near arena. Because .text spans only 90.1 MB, a single 2 MB arena mmap'd anywhere near the image serves every one of the 43,315 functions.",
+    "risk": "THE island is mandatory, not optional \u2014 I measured the actual distance from the game .text to a handler inside an LD_PRELOAD .so at +28,449,870,957,659 bytes (~26 TB); a bare rel32 silently truncates and segfaults (I reproduced exactly that crash before adding the island). Sample of 4000 functions: 15.1% have a RIP-relative operand and 12.8% have a rel branch/call inside the first \u22655 bytes, so the trampoline builder MUST relocate disp32 and rel32 \u2014 a naive length-decoder is not enough. Only 41 of 43,315 named functions are unpatchable (size + trailing int3 padding < 5). mprotect cost is negligible: 11.3 \u00b5s per page RWX\u2192write\u2192restore, or 1.5 ms to flip the whole 90 MB.",
+    "confidence": "high"
+   },
+   {
+    "where": "Choice of hooking library",
+    "how": "funchook (kubo/funchook) or Dobby. Both allocate trampolines within \u00b12 GB automatically, do the mprotect dance, and relocate RIP-relative and rel-branch prologue instructions. If hand-rolling, pair a real decoder (Zydis) with explicit disp32/rel32 fixup and reserve the near arena at constructor time before the heap grows.",
+    "risk": "subhook is the wrong choice here: its length decoding is minimal and would mangle the 15.1% of prologues with RIP-relative operands. I could not install or test funchook/Dobby in this environment, so their behaviour on THIS binary's prologues is unverified \u2014 validate against a corpus of real BG3 entry points before trusting it. Also check each library's license against your distribution plans.",
+    "confidence": "medium"
+   },
+   {
+    "where": "Intel CET / endbr64",
+    "how": "Nothing to do. Patch the first byte of the function directly; there is no endbr64 landing pad to preserve and no IBT to trip.",
+    "risk": "None for the game binary. But note that libc/libSDL2 from a modern host or the Steam runtime ARE built with -fcf-protection, so if you ever inline-hook into a *system* library your island's indirect jump must land on an endbr64. Keep game hooks and libc hooks on separate code paths.",
+    "confidence": "high"
+   },
+   {
+    "where": "Imported functions (808 PLT slots): SDL_*, the 32 COsiris entry points, Steam, libc",
+    "how": "Plain LD_PRELOAD interposition. Define the symbol in your .so, recover the real one with dlsym(RTLD_NEXT, \u2026). No inline hooking, no mprotect, no address table, survives every patch. SDL_PollEvent is the single best tick: one call site (0x2e9e7c7), a `while(SDL_PollEvent(&ev))` drain loop, so the call that returns 0 is a clean end-of-frame-input hook.",
+    "risk": "Does NOT work for pthread_create \u2014 the executable defines and exports it at 0x3357fc0 and the exe always wins the global symbol search; I verified this empirically with a repro where an exe-defined symbol beat the preload. If you want that one, inline-hook it. Also: any function the game resolves itself via dlsym(RTLD_NEXT) bypasses your definition by design.",
+    "confidence": "high"
+   },
+   {
+    "where": "GOT interposition of PLT imports without LD_PRELOAD",
+    "how": "Walk the mapped _DYNAMIC for DT_JMPREL/DT_PLTRELSZ/DT_SYMTAB/DT_STRTAB (all four are inside LOAD[0], file offsets 0x74ac88 / 0x340 / 0x5944 \u2014 no disk I/O needed), find the JUMP_SLOT whose symbol name you want, and overwrite the 8-byte .got.plt entry.",
+    "risk": "Free of mprotect because .got.plt (0x7b615b0\u20130x7b62f08) is outside GNU_RELRO (which ends at 0x7af8000) \u2014 verified by containment arithmetic. But there is no DT_BIND_NOW, so binding is LAZY: before the first call, the GOT slot holds the push/jmp-back-to-PLT0 address, not the resolved function. Never save the pre-hook GOT value as your \"original\" \u2014 get the real target with dlsym instead. Also, this only redirects calls that go through THIS module's GOT; calls originating inside libSDL2 itself are unaffected.",
+    "confidence": "high"
+   },
+   {
+    "where": "Getting loaded at all \u2014 option A: Steam launch options",
+    "how": "`LD_PRELOAD=/full/path/to/libbg3x.so %command%` in the game's Steam launch options. %command% expands to the whole launcher command line, so the variable is set on the outermost process and inherited down.",
+    "risk": "Under the Steam Linux Runtime (pressure-vessel) the game runs in a container where host paths are remapped; a path inside the game's own install directory is bind-mounted and survives, a path under host /usr or /home may not. Our .so must also be ABI-compatible with the container's glibc, not the host's. I could not test any of this here \u2014 Steam-container behaviour is documentation/experience, not something I verified in this binary.",
+    "confidence": "low"
+   },
+   {
+    "where": "Getting loaded at all \u2014 option B: DT_NEEDED shim (recommended)",
+    "how": "Rename the shipped libOsiris.so to libOsiris_real.so, and drop in our own libOsiris.so built with `-Wl,-soname,libOsiris.so -Wl,--no-as-needed -lOsiris_real -Wl,-rpath,$ORIGIN`. I BUILT AND RAN this: the shim's constructor fires, and every symbol the game imports still resolves transparently through the real library pulled in as the shim's own dependency. Adding a definition of an Osiris symbol to the shim makes the shim win the search order, with dlsym(RTLD_NEXT) reaching the real one \u2014 also verified running. This is the ELF equivalent of the Windows DLL-proxy trick and needs no LD_PRELOAD, no launch options, and works identically inside a Steam container.",
+    "risk": "The game's DT_RUNPATH is `$ORIGIN`, so the shim must live in the game directory and carry its own `$ORIGIN` runpath (mine did). You must not accidentally strip or reorder the DT_NEEDED. Breaks if Larian ever adds an integrity check on the game directory (none exists today). Renaming a shipped file means Steam's \"verify integrity\" will restore libOsiris.so and clobber the shim \u2014 the installer must handle that.",
+    "confidence": "high"
+   },
+   {
+    "where": "When to run: constructor ordering",
+    "how": "Both an LD_PRELOAD .so and the DT_NEEDED shim run their constructors BEFORE the executable's init_array. I verified the ordering empirically (`[preload] constructor` \u2192 `[exe] init_array entry 1` \u2192 `[exe] init_array LAST` \u2192 `[exe] main()`) on glibc 2.39. That is the ideal moment to install hooks: single-threaded, nothing initialised yet, no locks held.",
+    "risk": "The binary has 24,135 init_array entries (INIT_ARRAYSZ 193080 / 8), so at constructor time essentially nothing is set up \u2014 ECS type indices at 0x7b6fed0+ are all still zero. Anything needing live game state must be deferred to a hooked runtime function. Bigger trap: main() fork()s at 0x5a0a5ff, so your constructor state is inherited by BOTH the supervisor and the game child. Do not spawn threads, take locks, or open sockets in the constructor \u2014 a mutex held by a thread that does not survive fork deadlocks the child. Defer heavy init to the first SDL_PollEvent tick.",
+    "confidence": "high"
+   },
+   {
+    "where": "Debugging: neutralising crashpad",
+    "how": "Three verified levers, in order of preference. (1) Pass `--no-crash-reporter` on the command line \u2014 CFG-verified to skip both fork() and the crashpad StartHandler block. (2) Attach a debugger: main calls IsDebuggerPresent at 0x5a0a462 and takes the same skip path, so gdb/lldb automatically disables the reporter. (3) Rename or remove `<gamedir>/handler` \u2014 StartHandler then fails with 'failed to start crashpad client' and no signal handlers are installed. As a runtime fallback, re-sigaction SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT/SIGTRAP to SIG_DFL after startup, since the only install site is 0x515842b.",
+    "risk": "With the crash reporter active the game runs as a fork() child, so plain `gdb ./bg3` lands on the waitpid supervisor \u2014 you need `set follow-fork-mode child`, or just use --no-crash-reporter to get a single process. Note that (2) means a debugger changes the process topology, so a bug that only reproduces under the forked configuration will vanish under gdb.",
+    "confidence": "high"
+   },
+   {
+    "where": "ABI matching for our .so",
+    "how": "The game statically links libc++ 18.1 (1,124 _ZNSt3__2 symbols; the 16 non-__2 std:: names carry the libc++ `B8ne180100` ABI tag) and does NOT link libstdc++ at all \u2014 no GLIBCXX/CXXABI version needs. Combined with only 4 exported dynamic symbols, there is ZERO C++ symbol collision risk: our .so may freely link libstdc++ or its own libc++. Max glibc requirement is GLIBC_2.28, so build against the oldest glibc you intend to support.",
+    "risk": "There is no shared C++ runtime, so exceptions, RTTI, std::string/std::vector layouts and typeinfo must NEVER cross the boundary. More concretely: the game's `operator new` at 0x2454490 is mimalloc-backed via TLS `_mi_heap_default`; any memory you hand to the game must come from ITS operator new (resolve 0x2454490/0x2397530 from .symtab) and any pointer it hands you must go back to its operator delete. Mixing heaps will corrupt mimalloc's page metadata. Also, do not link your own copy of mimalloc.",
+    "confidence": "high"
+   }
+  ],
+  "negative_results": [
+   "NO Intel CET / IBT. I scanned all 0x565c316 bytes of .text for f3 0f 1e fa: exactly 0 occurrences (and 0 endbr32). readelf -n shows only NT_GNU_ABI_TAG and NT_GNU_BUILD_ID \u2014 there is no .note.gnu.property, so no GNU_PROPERTY_X86_FEATURE_1_IBT/SHSTK. The .plt is the classic non-IBT form (`ff 35 <got+8> / ff 25 <got+16>` then `ff 25 / 68 idx / e9`). Naive entry-point patching is safe and no endbr64 landing pad is needed.",
+   "NO anti-tamper, NO anti-debug, NO self-integrity checking. Every one of the 9 ptrace call sites belongs to crashpad (Ptracer::GetThreadInfo/ReadUpTo/ReadLastBytes, PtraceAttach, PtraceDetach) and all 6 prctl call sites belong to crashpad (ScopedPrSetDumpable, InitializeSignalStackForThread, WaitForCrashDumpComplete). mprotect is called from exactly 2 sites, one of them crashpad's signal-stack setup. A string search for tamper/integrity/self-check/anti-cheat/debugger-detected returned nothing. The only /proc/self/status + TracerPid read (0x3812840) is used to DISABLE the crash reporter under a debugger \u2014 the opposite of anti-debug.",
+   "LD_PRELOAD cannot interpose ANY Larian game function. .dynsym has 823 entries of which 819 are UND; the only defined entries are pthread_create, _edata, __bss_start and _end. There is no game function to interpose. Worse, I proved with a 3-file repro (exe + liba.so + preload.so) that a symbol defined by the EXECUTABLE beats LD_PRELOAD entirely \u2014 the exe copy ran both with and without the preload \u2014 so pthread_create at 0x3357fc0 specifically is off-limits to preloading.",
+   "The reloc-derived cross-reference graph is NOT available at runtime. .rela.text (71 MB, file offset 0x7b5ff08) has sh_addr 0 and lies past the highest mapped file offset (0x7b5ff08 is exactly the end of the last PT_LOAD). Same for .symtab (0xc7ec8a8) and .strtab (0xcb69b13). Anything that depends on the xref graph must be precomputed offline.",
+   "No full RELRO and no BIND_NOW. DT_FLAGS_1 is `PIE` only; there is no DT_BIND_NOW and no DF_BIND_NOW. GNU_RELRO ends at 0x7af8000 while .got.plt starts at 0x7b615b0, so the PLT GOT stays writable for the process lifetime.",
+   "The int3-padding hot-patch trick is not general here. Measuring int3 runs immediately before all 43,315 sized FUNC entries: only 13.6% have \u226514 bytes of preceding padding, and the distribution is nearly uniform from 0 to 15 bytes (5.5% have none at all). Function starts are 16-byte aligned in 42,963 of 43,315 cases, so the padding is whatever the previous function's tail left over.",
+   "No native plugin or mod-loading mechanism exists. The only dlopen call sites are Wwise plugin DLLs, libasound.so.2, libpulse.so.0, libcuda.so (PhysX GPU) and libvulkan.so/.1 \u2014 all third-party. There is no Larian-authored extension load path, so LD_PRELOAD or the DT_NEEDED shim are the only entries.",
+   "No libstdc++ anywhere. DT_NEEDED lists libSDL2, libsteam_api, libBink2x64, libOsiris, libdl, libnvsdk_ngx, libm, libpthread, libssl.so.1.1, libcrypto.so.1.1, libc, ld-linux, librt \u2014 and no libstdc++. readelf --dyn-syms shows zero GLIBCXX/CXXABI version requirements. The C++ runtime is statically linked libc++ 18.1.",
+   "No steam_appid.txt handling in the binary. A string search for steam_appid / SteamAppId / 1086940 returned zero hits; the AppID appears only as the immediate `mov edi,0x1095dc` fed to SteamAPI_RestartAppIfNecessary.",
+   "Runtime signature scanning is a poor primary strategy on this binary. A 12-byte masked pattern taken from real code cost 110 ms naive / 40 ms memmem-accelerated over the 90.1 MB .text, and produced 24 matches rather than 1. Uniqueness cannot be assumed at this code size."
+  ],
+  "open_questions": [
+   "Does the RETAIL Steam build actually retain .symtab? The file at /project/uploads/bg3 is 'not stripped', but I cannot confirm it is byte-identical to what ships. If Larian strips a release branch, the 27 ms symtab path disappears and everything falls back to the build-id offset table. The loader must detect SHT_SYMTAB absence and say so rather than crash.",
+   "Do `<gamedir>/handler` (crashpad) and `<gamedir>/LinuxCrashReporter` actually ship? I only have the executable. If `handler` is absent, StartHandler fails, crashpad installs no signal handlers, and the whole crash-interference concern is moot. Worth checking on a real install before building mitigations.",
+   "Steam Linux Runtime / pressure-vessel behaviour is entirely untested here. Whether LD_PRELOAD paths inside the game directory survive the container bind-mounts, and which glibc the container provides, needs to be measured on a real Steam Deck / Linux install. This is the single largest unverified assumption in the deployment story.",
+   "Is this native Linux ELF the shipped retail artifact, or an internal/Early-Access build? The build strings are '4.1.1.7398727' and 'GustavX', and main.cpp lives at /LSProjects/Apps/Gustav/Code/EoCApp/Linux/main.cpp. If BG3 ships to Linux only via Proton, the whole native-hooking design targets a binary users may not have.",
+   "Does the game install additional signal handlers later, from a worker thread? I found exactly one crashpad install site (0x515842b) plus scattered signal()/sigaction() in Noesis (0x37b35d9, 0x6aa3c36 region) and curl. I did not trace whether Noesis grabs SIGSEGV. Worth checking before assuming a single disarm point.",
+   "How do funchook and Dobby actually behave on real BG3 prologues? 15.1% RIP-relative and 12.8% rel-branch within the first 5 bytes is a demanding corpus, and I could not install either library in this environment. Build a harness that patches a few thousand real entry points offline and diffs the generated trampolines against a capstone reference before trusting any library.",
+   "What exactly does the parent supervisor do on abnormal child exit? I traced main's parent branch to waitpid + WIFSIGNALED decoding at 0x5a0ab7e, and separately found the LinuxCrashReporter fork/execve helper at 0x5a0ac70, but I did not prove the edge between them. It matters only for deciding whether our .so should detect that it is in the supervisor and go dormant.",
+   "Is `--no-crash-reporter` reachable through Steam? It has to be appended to the game's argv, which under Steam means launch options \u2014 but the game may be started by a launcher that rewrites argv. Unverified.",
+   "bg3q.py's `to` subcommand does not handle section-relative addends and silently returns wrong results for anonymous targets (it reported 116,707 references for SDL_PollEvent, which actually has exactly one PLT32 call site). The addend formula `target - 4 - 0x218be00` against dst=151262 works and I validated it against a brute-force byte scan \u2014 the tool should be fixed before anyone leans on `to` for hook-target discovery."
+  ]
+ }
+]
