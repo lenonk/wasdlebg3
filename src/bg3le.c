@@ -40,14 +40,16 @@ static int (*real_poll)(SDL_Event *);
 
 static FILE *g_logf;
 static int g_mirror_stderr;
-static int cfg_suppress, cfg_move, cfg_verbose, cfg_force, cfg_hook, cfg_padmode;
+static int cfg_suppress, cfg_move, cfg_verbose, cfg_force, cfg_hook, cfg_gate;
 
-/* The game checks this single byte before it will even ask for movement input.
- * In keyboard-and-mouse mode it is zero, so the whole direct-movement subsystem
- * is dormant — which is why our forced-input writes were being ignored. */
+/* The game checks a single byte before it will even ask for movement input, and
+ * in keyboard-and-mouse mode that byte is zero. Writing it every frame loses:
+ * a live test showed the engine resetting it before the movement code ran, every
+ * frame without exception. So we NOP the branches that read it instead. */
+#define MAX_GATES 8
 static volatile uint8_t *g_padflag;
-static uint8_t g_padflag_orig;
-static int g_padflag_saved;
+static bg3_patch g_gates[MAX_GATES];
+static size_t g_ngates;
 
 /* Counts calls to the game's movement-input fetch. If this stays at zero while
  * keys are held, the game simply never asks for movement input in this mode —
@@ -152,12 +154,27 @@ static void identify_host(void)
     lg("state ptr @%#lx, vec +%#x, flag +%#x",
        g_sig.global_slot, g_sig.vec_off, g_sig.flag_off);
 
-    g_padflag = (volatile uint8_t *)bg3_find_padmode_flag(r.code, r.len, r.va,
-                                                          g_sig.match_va - 10);
-    if (g_padflag)
-        lg("controller-mode flag @%p (currently %u)", (void *)g_padflag, *g_padflag);
-    else
+    uintptr_t fetch = g_sig.match_va - 10;
+    g_padflag = (volatile uint8_t *)bg3_find_padmode_flag(r.code, r.len, r.va, fetch);
+    if (!g_padflag) {
         lg("controller-mode flag NOT found — movement will stay dormant");
+    } else if (cfg_gate) {
+        uintptr_t gates[MAX_GATES];
+        size_t ng = bg3_find_move_gates(r.code, r.len, r.va, fetch,
+                                        (uintptr_t)g_padflag, gates, MAX_GATES);
+        lg("controller-mode flag @%p (currently %u); %zu gate branch(es)",
+           (void *)g_padflag, *g_padflag, ng);
+        static const uint8_t je6[2] = {0x0F, 0x84};
+        for (size_t i = 0; i < ng; i++) {
+            uint8_t expect[6];
+            memcpy(expect, (const void *)gates[i], 6);
+            if (memcmp(expect, je6, 2) != 0) continue;
+            int rc3 = bg3_patch_nop(gates[i], 6, expect, &g_gates[g_ngates]);
+            lg("gate @%#lx: %s (rc=%d)", gates[i],
+               rc3 == BG3_HOOK_OK ? "NOPed" : "NOT patched", rc3);
+            if (rc3 == BG3_HOOK_OK) g_ngates++;
+        }
+    }
 
     if (cfg_hook) {
         /* The prologue starts 10 bytes before the signature match. We verify the
@@ -248,7 +265,7 @@ static void tick(void)
 
     if (g_frames % HEARTBEAT_FRAMES == 0) {
         unsigned gate = g_have_ctl ? *(volatile uint32_t *)(g_ctl.block + GATE_OFF) : 0;
-        lg("frame %lu: block=%s pad=%u gate=%u calls=%llu readback vec=(%.2f,%.2f) flag=%u keys(w%d a%d s%d d%d)",
+        lg("frame %lu: block=%s pad=%u gated=%u calls=%llu readback vec=(%.2f,%.2f) flag=%u keys(w%d a%d s%d d%d)",
            g_frames, g_have_ctl ? "live" : "null",
            g_padflag ? *g_padflag : 0, gate,
            g_hooked ? (unsigned long long)*g_hook.counter : 0ULL,
@@ -265,23 +282,6 @@ static void tick(void)
         return;
 
     int x = held.d - held.a, y = held.s - held.w;
-
-    /* Open the gate. Setting the raw byte rather than calling the game's own
-     * ActivateControllerMode is deliberate: that function also drives a wholesale
-     * Noesis UI reload into the controller theme, which we do not want. */
-    if (g_padflag && cfg_padmode) {
-        if (!g_padflag_saved) {
-            g_padflag_orig = *g_padflag;
-            g_padflag_saved = 1;
-        }
-        int want = (cfg_padmode == 2) ? (x || y) : 1;
-        if (want && !*g_padflag) {
-            *g_padflag = 1;
-            lg("opened the controller-mode gate on frame %lu", g_frames);
-        } else if (!want && *g_padflag && cfg_padmode == 2) {
-            *g_padflag = g_padflag_orig;
-        }
-    }
 
     if (!x && !y) {
         /* Leaving the flag set with a stale vector walks the character forever. */
@@ -358,10 +358,9 @@ __attribute__((destructor)) static void bg3le_fini(void)
         *g_ctl.flag = 0;
         lg("cleared movement flag on unload");
     }
-    if (g_padflag && g_padflag_saved) {
-        *g_padflag = g_padflag_orig;
-        lg("restored the controller-mode flag to %u", g_padflag_orig);
-    }
+    for (size_t i = 0; i < g_ngates; i++)
+        bg3_patch_restore(&g_gates[i]);
+    if (g_ngates) lg("restored %zu gate branch(es)", g_ngates);
     if (g_hooked) {
         lg("GetMoveInput was called %llu times this session",
            (unsigned long long)*g_hook.counter);
@@ -403,14 +402,11 @@ __attribute__((constructor)) static void bg3le_init(void)
     cfg_verbose = envflag("BG3LE_VERBOSE", 0);
     cfg_force = envflag("BG3LE_FORCE", 0);
     cfg_hook = envflag("BG3LE_HOOK", 1);
-    {   /* 0 = leave alone, 1 = hold the gate open, 2 = only while moving */
-        const char *v = getenv("BG3LE_PADMODE");
-        cfg_padmode = v ? atoi(v) : 1;
-    }
+    cfg_gate = envflag("BG3LE_GATE", 1);
     if (cfg_verbose && g_logf != stderr) g_mirror_stderr = 1;
 
     identify_host();
     if (g_is_bg3)
-        lg("armed (move=%d suppress=%d padmode=%d hook=%d)",
-           cfg_move, cfg_suppress, cfg_padmode, cfg_hook);
+        lg("armed (move=%d suppress=%d gate=%d hook=%d, %zu gates NOPed)",
+           cfg_move, cfg_suppress, cfg_gate, cfg_hook, g_ngates);
 }

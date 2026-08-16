@@ -30,6 +30,14 @@ int bg3_find_move_sig(const uint8_t *code, size_t len, uintptr_t base_va, bg3_mo
 uintptr_t bg3_find_padmode_flag(const uint8_t *code, size_t len, uintptr_t base_va,
                                 uintptr_t fetch_fn);
 
+/* Locates the `je` branches that skip the movement-input fetch when the game is
+ * not in controller mode. Writing the flag itself loses a per-frame race against
+ * the engine's input-mode arbiter, so these branches get NOPed instead. Fills
+ * `out` with the branch addresses and returns how many were found. */
+size_t bg3_find_move_gates(const uint8_t *code, size_t len, uintptr_t base_va,
+                           uintptr_t fetch_fn, uintptr_t flag,
+                           uintptr_t *out, size_t max);
+
 /* Live movement state, derived from a signature match. */
 typedef struct {
     uintptr_t block;        /* base of the state block the game allocated */

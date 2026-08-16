@@ -104,6 +104,53 @@ int bg3_hook_count_calls(uintptr_t target, const uint8_t *expect, bg3_hook *h)
     return BG3_HOOK_OK;
 }
 
+/* Canonical multi-byte NOPs, indexed by length. */
+static const uint8_t NOPS[9][8] = {
+    {0}, {0x90},
+    {0x66, 0x90},
+    {0x0F, 0x1F, 0x00},
+    {0x0F, 0x1F, 0x40, 0x00},
+    {0x0F, 0x1F, 0x44, 0x00, 0x00},
+    {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00},
+    {0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00},
+    {0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},
+};
+
+int bg3_patch_nop(uintptr_t addr, size_t len, const uint8_t *expect, bg3_patch *p)
+{
+    memset(p, 0, sizeof *p);
+    if (len < 2 || len > 8)
+        return BG3_HOOK_UNALIGNED;
+    if (memcmp((const void *)addr, expect, len) != 0)
+        return BG3_HOOK_MISMATCH;
+
+    uintptr_t word = addr & ~(uintptr_t)7;
+    if (addr + len > word + 8)
+        return BG3_HOOK_UNALIGNED;   /* straddles two words; refuse rather than tear */
+
+    if (unprotect(word, 8) != 0)
+        return BG3_HOOK_MPROTECT;
+
+    uint8_t buf[8];
+    memcpy(buf, (const void *)word, 8);
+    memcpy(&p->original, buf, 8);
+    memcpy(buf + (addr - word), NOPS[len], len);
+
+    uint64_t want;
+    memcpy(&want, buf, 8);
+    p->word = word;
+    p->active = 1;
+    __atomic_store_n((uint64_t *)word, want, __ATOMIC_SEQ_CST);
+    return BG3_HOOK_OK;
+}
+
+void bg3_patch_restore(bg3_patch *p)
+{
+    if (!p->active) return;
+    __atomic_store_n((uint64_t *)p->word, p->original, __ATOMIC_SEQ_CST);
+    p->active = 0;
+}
+
 void bg3_hook_remove(bg3_hook *h)
 {
     if (!h->target) return;

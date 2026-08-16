@@ -75,6 +75,13 @@ int main(void)
     snprintf(buf, sizeof buf, "%#lx (expected 0x7d9d108)", (unsigned long)flag);
     ok(flag == 0x7d9d108, "derived the controller-mode flag from call sites", buf);
 
+    uintptr_t gates[8];
+    size_t ng = bg3_find_move_gates(m + text->sh_offset, text->sh_size, text->sh_addr,
+                                    fetch, flag, gates, 8);
+    snprintf(buf, sizeof buf, "%zu found, first %#lx (expected 0x290a3e2)", ng,
+             ng ? (unsigned long)gates[0] : 0UL);
+    ok(ng >= 1 && gates[0] == 0x290a3e2, "located the controller-mode gate branch", buf);
+
     /* A scanner that matches anything is worthless — check it rejects noise. */
     static uint8_t noise[1 << 20];
     for (size_t i = 0; i < sizeof noise; i++) noise[i] = (uint8_t)(i * 31 + (i >> 8));

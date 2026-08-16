@@ -1,6 +1,7 @@
 #ifndef BG3LE_HOOK_H
 #define BG3LE_HOOK_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 enum {
@@ -23,5 +24,18 @@ typedef struct {
 int bg3_hook_count_calls(uintptr_t target, const uint8_t *expect, bg3_hook *h);
 
 void bg3_hook_remove(bg3_hook *h);
+
+/* A NOP patch over a conditional branch, applied as one aligned atomic store so
+ * a thread executing the site can never observe a half-written instruction. */
+typedef struct {
+    uintptr_t word;      /* aligned 8-byte word we rewrote */
+    uint64_t original;
+    int active;
+} bg3_patch;
+
+/* NOPs `len` bytes at `addr` (len must be 2..8 and fit in one aligned word).
+ * Verifies the existing bytes match `expect` first. Returns 0 on success. */
+int bg3_patch_nop(uintptr_t addr, size_t len, const uint8_t *expect, bg3_patch *p);
+void bg3_patch_restore(bg3_patch *p);
 
 #endif

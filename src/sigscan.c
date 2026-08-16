@@ -116,6 +116,39 @@ uintptr_t bg3_find_padmode_flag(const uint8_t *code, size_t len, uintptr_t base_
     return best >= 0 ? cand[best] : 0;
 }
 
+size_t bg3_find_move_gates(const uint8_t *code, size_t len, uintptr_t base_va,
+                           uintptr_t fetch_fn, uintptr_t flag,
+                           uintptr_t *out, size_t max)
+{
+    size_t n = 0;
+    for (size_t i = 0; i + 5 <= len && n < max; i++) {
+        if (code[i] != 0xE8) continue;
+        int32_t rel;
+        memcpy(&rel, code + i + 1, 4);
+        if (base_va + i + 5 + rel != fetch_fn) continue;
+
+        size_t from = i > GUARD_WINDOW ? i - GUARD_WINDOW : 0;
+        for (size_t j = from; j + 13 <= i && n < max; j++) {
+            /* cmp byte [rip+disp32], 0 */
+            if (code[j] != 0x80 || code[j + 1] != 0x3D || code[j + 6] != 0x00)
+                continue;
+            int32_t d;
+            memcpy(&d, code + j + 2, 4);
+            if (base_va + j + 7 + d != flag)
+                continue;
+            /* the six-byte `je rel32` immediately after it is the gate */
+            if (code[j + 7] != 0x0F || code[j + 8] != 0x84)
+                continue;
+            uintptr_t je = base_va + j + 7;
+            int dup = 0;
+            for (size_t k = 0; k < n; k++)
+                if (out[k] == je) { dup = 1; break; }
+            if (!dup) out[n++] = je;
+        }
+    }
+    return n;
+}
+
 int bg3_move_ctl_resolve(const bg3_move_sig *sig, bg3_move_ctl *out)
 {
     uintptr_t block = *(uintptr_t *)sig->global_slot;

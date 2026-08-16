@@ -123,7 +123,7 @@ Crashpad, so a crash may be swallowed or uploaded; the log file is the reliable 
 | `BG3LE_MOVE` | `1` | write the movement vector (`0` = observe only) |
 | `BG3LE_SUPPRESS` | `1` | hide WASD from the game's own hotkey handling |
 | `BG3LE_VERBOSE` | `0` | also log from non-game processes (Steam's helpers) |
-| `BG3LE_PADMODE` | `1` | hold the controller-mode gate open (`2` = only while moving, `0` = off) |
+| `BG3LE_GATE` | `1` | NOP the branches that skip movement input outside controller mode |
 | `BG3LE_HOOK` | `1` | install the call counter on the movement-input fetch |
 | `BG3LE_FORCE` | `0` | write even if the engine looks uninitialised |
 
