@@ -14,10 +14,13 @@
  *   BG3LE_INJECT=0|1     synthesise left-stick axis motion from held WASD keys
  */
 #define _GNU_SOURCE
+#include "sigscan.h"
 #include "symres.h"
 
 #include <SDL2/SDL.h>
 #include <dlfcn.h>
+#include <elf.h>
+#include <link.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,7 +32,13 @@
 static int (*real_poll)(SDL_Event *);
 
 static FILE *g_logf;
-static int cfg_suppress, cfg_inject;
+static int cfg_suppress, cfg_inject, cfg_move;
+
+/* Set once the override signature is located in the host's code. */
+static bg3_move_sig g_sig;
+static int g_have_sig;
+static bg3_move_ctl g_ctl;
+static int g_have_ctl;
 
 /* Held-state of the movement keys, maintained even when we swallow the events. */
 static struct { int w, a, s, d; } held;
@@ -118,6 +127,84 @@ static void queue_axis_events(void)
     lg("injecting left-stick (%d,%d)", ax, ay);
 }
 
+struct exec_range { const uint8_t *code; size_t len; uintptr_t va; };
+
+/* The first object dl_iterate_phdr reports is the main executable. We want its
+ * executable PT_LOAD, live in memory — scanning that rather than the file means
+ * the addresses we recover are already bias-adjusted. */
+static int exec_range_cb(struct dl_phdr_info *info, size_t sz, void *data)
+{
+    (void)sz;
+    struct exec_range *r = data;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *p = &info->dlpi_phdr[i];
+        if (p->p_type == PT_LOAD && (p->p_flags & PF_X) && p->p_memsz > r->len) {
+            r->va = info->dlpi_addr + p->p_vaddr;
+            r->code = (const uint8_t *)r->va;
+            r->len = p->p_memsz;
+        }
+    }
+    return 1;
+}
+
+static void scan_host_for_override(void)
+{
+    struct exec_range r = {0};
+    dl_iterate_phdr(exec_range_cb, &r);
+    if (!r.code) {
+        lg("no executable segment found — movement disabled");
+        return;
+    }
+
+    int rc = bg3_find_move_sig(r.code, r.len, r.va, &g_sig);
+    if (rc == 1) {
+        g_have_sig = 1;
+        lg("override signature @%#lx: global %#lx, vec +%#x, flag +%#x",
+           g_sig.match_va, g_sig.global_slot, g_sig.vec_off, g_sig.flag_off);
+    } else if (rc < 0) {
+        /* Refusing beats writing to a global we guessed at. */
+        lg("override signature is AMBIGUOUS — movement disabled");
+    } else {
+        lg("override signature not found in %zu KB — not BG3, or the build moved on",
+           r.len / 1024);
+    }
+}
+
+/* Hand the game a movement vector directly, instead of letting it poll the four
+ * CharacterMove* input actions. The engine treats this exactly like analog stick
+ * deflection: it applies its own deadzone, normalises, clamps, and rotates the
+ * vector into world space using the live camera. So what we write is
+ * camera-relative — which is precisely what WASD means — and the character walks
+ * through the ordinary locomotion, animation and collision path. */
+static void drive_movement(void)
+{
+    if (!cfg_move || !g_have_sig)
+        return;
+
+    /* The state block is allocated during startup, so this is null for a while. */
+    if (!g_have_ctl) {
+        if (!bg3_move_ctl_resolve(&g_sig, &g_ctl))
+            return;
+        g_have_ctl = 1;
+        lg("movement control live: vec @%p flag @%p", (void *)g_ctl.vec, (void *)g_ctl.flag);
+    }
+
+    int x = held.d - held.a, y = held.s - held.w;
+    if (!x && !y) {
+        /* Leaving the flag set with a stale vector walks the character forever. */
+        if (*g_ctl.flag) {
+            *g_ctl.flag = 0;
+            lg("movement released");
+        }
+        return;
+    }
+    /* Magnitude 1.0 in any direction; the engine's own clamp handles the rest. */
+    double mag = (x && y) ? 0.70710678 : 1.0;
+    g_ctl.vec[0] = (float)(x * mag);
+    g_ctl.vec[1] = (float)(y * mag);
+    *g_ctl.flag = 1;
+}
+
 int SDL_PollEvent(SDL_Event *ev)
 {
     if (!real_poll) {
@@ -135,8 +222,12 @@ int SDL_PollEvent(SDL_Event *ev)
             return 1;
         }
         int r = real_poll(ev);
-        if (!r)
+        if (!r) {
+            /* The game drains events until this returns 0, so here we are exactly
+             * once per frame, on the main thread, before the frame is simulated. */
+            drive_movement();
             return 0;
+        }
         if (intercept(ev)) {
             queue_axis_events();
             continue; /* swallowed — hand the game the next event instead */
@@ -153,8 +244,10 @@ __attribute__((constructor)) static void bg3le_init(void)
     if (!g_logf) g_logf = stderr;
     cfg_suppress = envflag("BG3LE_SUPPRESS", 1);
     cfg_inject = envflag("BG3LE_INJECT", 0);
+    cfg_move = envflag("BG3LE_MOVE", 1);
 
-    lg("loaded (suppress=%d inject=%d)", cfg_suppress, cfg_inject);
+    lg("loaded (suppress=%d move=%d inject=%d)", cfg_suppress, cfg_move, cfg_inject);
+    scan_host_for_override();
 
     char err[256] = {0};
     sr_ctx *c = sr_open_self(err, sizeof err);

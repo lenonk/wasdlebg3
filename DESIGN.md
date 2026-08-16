@@ -172,13 +172,15 @@ forced-input global write described above.
 
 ```
 bg3-extender/
-  src/symres.{c,h}      runtime .symtab resolution (done)
-  src/bg3le.c           the preloaded shim (input side done)
-  src/sigscan.c         signature -> global/offset derivation   <- write next
-  src/move.c            forced-input writer                      <- write next
-  test/                 stand-in game + assertions (done)
+  src/symres.{c,h}      runtime .symtab resolution                      (done)
+  src/sigscan.{c,h}     signature -> global + offsets, no hardcoding    (done)
+  src/bg3le.c           the preloaded shim: input side + movement write (done)
+  test/                 stand-in game + assertions                      (done)
   analysis/             bg3q.py, callers.py, build_index.py, BINARY-FACTS.md, dossier.json
 ```
+
+Everything above is written and passing. What remains is not more code — it is step 2 of the
+staged plan, which needs BG3 actually installed.
 
 ## Prior art worth knowing
 
