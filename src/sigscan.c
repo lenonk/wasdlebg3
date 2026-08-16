@@ -80,6 +80,42 @@ int bg3_find_move_sig(const uint8_t *code, size_t len, uintptr_t base_va, bg3_mo
     return hits == 1;
 }
 
+/* How far back from a call site to look for its guarding mode check. */
+#define GUARD_WINDOW 0x300
+#define MAX_CAND 16
+
+uintptr_t bg3_find_padmode_flag(const uint8_t *code, size_t len, uintptr_t base_va,
+                                uintptr_t fetch_fn)
+{
+    uintptr_t cand[MAX_CAND];
+    int count[MAX_CAND], n = 0;
+
+    for (size_t i = 0; i + 5 <= len; i++) {
+        if (code[i] != 0xE8) continue;
+        int32_t rel;
+        memcpy(&rel, code + i + 1, 4);
+        if (base_va + i + 5 + rel != fetch_fn) continue;
+
+        /* Walk back over the caller looking for `cmp byte [rip+disp32], 0`. */
+        size_t from = i > GUARD_WINDOW ? i - GUARD_WINDOW : 0;
+        for (size_t j = from; j + 7 <= i; j++) {
+            if (code[j] != 0x80 || code[j + 1] != 0x3D || code[j + 6] != 0x00)
+                continue;
+            int32_t d;
+            memcpy(&d, code + j + 2, 4);
+            uintptr_t flag = base_va + j + 7 + d;
+            int k = 0;
+            for (; k < n; k++)
+                if (cand[k] == flag) { count[k]++; break; }
+            if (k == n && n < MAX_CAND) { cand[n] = flag; count[n] = 1; n++; }
+        }
+    }
+    int best = -1;
+    for (int k = 0; k < n; k++)
+        if (best < 0 || count[k] > count[best]) best = k;
+    return best >= 0 ? cand[best] : 0;
+}
+
 int bg3_move_ctl_resolve(const bg3_move_sig *sig, bg3_move_ctl *out)
 {
     uintptr_t block = *(uintptr_t *)sig->global_slot;

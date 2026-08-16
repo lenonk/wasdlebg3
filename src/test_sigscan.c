@@ -68,6 +68,13 @@ int main(void)
     snprintf(buf, sizeof buf, "%#x (expected 0x139c)", sig.flag_off);
     ok(sig.flag_off == 0x139c, "recovered the enable-flag offset", buf);
 
+    /* The controller-mode flag must be derived, not hardcoded. */
+    uintptr_t fetch = sig.match_va - 10;
+    uintptr_t flag = bg3_find_padmode_flag(m + text->sh_offset, text->sh_size,
+                                           text->sh_addr, fetch);
+    snprintf(buf, sizeof buf, "%#lx (expected 0x7d9d108)", (unsigned long)flag);
+    ok(flag == 0x7d9d108, "derived the controller-mode flag from call sites", buf);
+
     /* A scanner that matches anything is worthless — check it rejects noise. */
     static uint8_t noise[1 << 20];
     for (size_t i = 0; i < sizeof noise; i++) noise[i] = (uint8_t)(i * 31 + (i >> 8));

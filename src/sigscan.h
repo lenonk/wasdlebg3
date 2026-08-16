@@ -23,6 +23,13 @@ typedef struct {
  * matched more than once (ambiguous — refuse rather than guess). */
 int bg3_find_move_sig(const uint8_t *code, size_t len, uintptr_t base_va, bg3_move_sig *out);
 
+/* Locates the controller-mode flag: a single byte the game checks before it will
+ * ask for movement input at all. Derived by finding call sites of the movement
+ * input fetch and walking back to the `cmp byte [rip+d], 0` that guards them, so
+ * no address is hardcoded. Returns the flag's address, or 0 if not found. */
+uintptr_t bg3_find_padmode_flag(const uint8_t *code, size_t len, uintptr_t base_va,
+                                uintptr_t fetch_fn);
+
 /* Live movement state, derived from a signature match. */
 typedef struct {
     uintptr_t block;        /* base of the state block the game allocated */

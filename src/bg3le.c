@@ -40,7 +40,14 @@ static int (*real_poll)(SDL_Event *);
 
 static FILE *g_logf;
 static int g_mirror_stderr;
-static int cfg_suppress, cfg_move, cfg_verbose, cfg_force, cfg_hook;
+static int cfg_suppress, cfg_move, cfg_verbose, cfg_force, cfg_hook, cfg_padmode;
+
+/* The game checks this single byte before it will even ask for movement input.
+ * In keyboard-and-mouse mode it is zero, so the whole direct-movement subsystem
+ * is dormant — which is why our forced-input writes were being ignored. */
+static volatile uint8_t *g_padflag;
+static uint8_t g_padflag_orig;
+static int g_padflag_saved;
 
 /* Counts calls to the game's movement-input fetch. If this stays at zero while
  * keys are held, the game simply never asks for movement input in this mode —
@@ -145,6 +152,13 @@ static void identify_host(void)
     lg("state ptr @%#lx, vec +%#x, flag +%#x",
        g_sig.global_slot, g_sig.vec_off, g_sig.flag_off);
 
+    g_padflag = (volatile uint8_t *)bg3_find_padmode_flag(r.code, r.len, r.va,
+                                                          g_sig.match_va - 10);
+    if (g_padflag)
+        lg("controller-mode flag @%p (currently %u)", (void *)g_padflag, *g_padflag);
+    else
+        lg("controller-mode flag NOT found — movement will stay dormant");
+
     if (cfg_hook) {
         /* The prologue starts 10 bytes before the signature match. We verify the
          * bytes before patching, so a wrong guess refuses rather than corrupts. */
@@ -234,8 +248,9 @@ static void tick(void)
 
     if (g_frames % HEARTBEAT_FRAMES == 0) {
         unsigned gate = g_have_ctl ? *(volatile uint32_t *)(g_ctl.block + GATE_OFF) : 0;
-        lg("frame %lu: block=%s gate[+0xe98]=%u calls=%llu readback vec=(%.2f,%.2f) flag=%u keys(w%d a%d s%d d%d)",
-           g_frames, g_have_ctl ? "live" : "null", gate,
+        lg("frame %lu: block=%s pad=%u gate=%u calls=%llu readback vec=(%.2f,%.2f) flag=%u keys(w%d a%d s%d d%d)",
+           g_frames, g_have_ctl ? "live" : "null",
+           g_padflag ? *g_padflag : 0, gate,
            g_hooked ? (unsigned long long)*g_hook.counter : 0ULL,
            g_have_ctl ? (double)g_ctl.vec[0] : 0.0,
            g_have_ctl ? (double)g_ctl.vec[1] : 0.0,
@@ -250,6 +265,24 @@ static void tick(void)
         return;
 
     int x = held.d - held.a, y = held.s - held.w;
+
+    /* Open the gate. Setting the raw byte rather than calling the game's own
+     * ActivateControllerMode is deliberate: that function also drives a wholesale
+     * Noesis UI reload into the controller theme, which we do not want. */
+    if (g_padflag && cfg_padmode) {
+        if (!g_padflag_saved) {
+            g_padflag_orig = *g_padflag;
+            g_padflag_saved = 1;
+        }
+        int want = (cfg_padmode == 2) ? (x || y) : 1;
+        if (want && !*g_padflag) {
+            *g_padflag = 1;
+            lg("opened the controller-mode gate on frame %lu", g_frames);
+        } else if (!want && *g_padflag && cfg_padmode == 2) {
+            *g_padflag = g_padflag_orig;
+        }
+    }
+
     if (!x && !y) {
         /* Leaving the flag set with a stale vector walks the character forever. */
         if (*g_ctl.flag) {
@@ -325,6 +358,10 @@ __attribute__((destructor)) static void bg3le_fini(void)
         *g_ctl.flag = 0;
         lg("cleared movement flag on unload");
     }
+    if (g_padflag && g_padflag_saved) {
+        *g_padflag = g_padflag_orig;
+        lg("restored the controller-mode flag to %u", g_padflag_orig);
+    }
     if (g_hooked) {
         lg("GetMoveInput was called %llu times this session",
            (unsigned long long)*g_hook.counter);
@@ -366,9 +403,14 @@ __attribute__((constructor)) static void bg3le_init(void)
     cfg_verbose = envflag("BG3LE_VERBOSE", 0);
     cfg_force = envflag("BG3LE_FORCE", 0);
     cfg_hook = envflag("BG3LE_HOOK", 1);
+    {   /* 0 = leave alone, 1 = hold the gate open, 2 = only while moving */
+        const char *v = getenv("BG3LE_PADMODE");
+        cfg_padmode = v ? atoi(v) : 1;
+    }
     if (cfg_verbose && g_logf != stderr) g_mirror_stderr = 1;
 
     identify_host();
     if (g_is_bg3)
-        lg("armed (move=%d suppress=%d force=%d)", cfg_move, cfg_suppress, cfg_force);
+        lg("armed (move=%d suppress=%d padmode=%d hook=%d)",
+           cfg_move, cfg_suppress, cfg_padmode, cfg_hook);
 }
