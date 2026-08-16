@@ -5,7 +5,7 @@ SDL_LIBS   := $(shell pkg-config --libs sdl2)
 BUILD   := build
 
 .PHONY: all test clean
-all: $(BUILD)/bg3le.so
+all: $(BUILD)/bg3le.so $(BUILD)/bg3le-check
 
 $(BUILD):
 	@mkdir -p $@
@@ -32,3 +32,6 @@ clean:
 
 $(BUILD)/test_sigscan: src/test_sigscan.c src/sigscan.c src/sigscan.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/test_sigscan.c src/sigscan.c
+
+$(BUILD)/bg3le-check: src/check.c src/sigscan.c src/sigscan.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ src/check.c src/sigscan.c
