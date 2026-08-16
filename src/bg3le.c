@@ -265,7 +265,7 @@ static void tick(void)
 
     if (g_frames % HEARTBEAT_FRAMES == 0) {
         unsigned gate = g_have_ctl ? *(volatile uint32_t *)(g_ctl.block + GATE_OFF) : 0;
-        lg("frame %lu: block=%s pad=%u gated=%u calls=%llu readback vec=(%.2f,%.2f) flag=%u keys(w%d a%d s%d d%d)",
+        lg("frame %lu: block=%s pad=%u e98=%u calls=%llu readback vec=(%.2f,%.2f) flag=%u keys(w%d a%d s%d d%d)",
            g_frames, g_have_ctl ? "live" : "null",
            g_padflag ? *g_padflag : 0, gate,
            g_hooked ? (unsigned long long)*g_hook.counter : 0ULL,
@@ -281,7 +281,10 @@ static void tick(void)
     if (!engine_ready() && !cfg_force)
         return;
 
-    int x = held.d - held.a, y = held.s - held.w;
+    /* Y is positive-forward here. SDL's stick convention is the opposite
+     * (negative is up) and following it sent the character backwards, so this
+     * axis is deliberately not SDL-signed. */
+    int x = held.d - held.a, y = held.w - held.s;
 
     if (!x && !y) {
         /* Leaving the flag set with a stale vector walks the character forever. */
@@ -322,7 +325,7 @@ static int intercept(const SDL_Event *ev)
         *slot = down;
         lg("key %s %s -> vector (%+d,%+d)",
            SDL_GetScancodeName(ev->key.keysym.scancode), down ? "down" : "up",
-           held.d - held.a, held.s - held.w);
+           held.d - held.a, held.w - held.s);
     }
     return cfg_suppress;
 }
@@ -362,7 +365,9 @@ __attribute__((destructor)) static void bg3le_fini(void)
         bg3_patch_restore(&g_gates[i]);
     if (g_ngates) lg("restored %zu gate branch(es)", g_ngates);
     if (g_hooked) {
-        lg("GetMoveInput was called %llu times this session",
+        /* The game forks after init, so a child's destructor sees a
+         * copy-on-write island frozen at zero. Trust the heartbeat, not this. */
+        lg("GetMoveInput count in this process: %llu (0 here just means a forked copy)",
            (unsigned long long)*g_hook.counter);
         bg3_hook_remove(&g_hook);
     }
