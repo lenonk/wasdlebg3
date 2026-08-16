@@ -122,7 +122,19 @@ Crashpad, so a crash may be swallowed or uploaded; the log file is the reliable 
 | `BG3LE_LOG` | stderr | log file path |
 | `BG3LE_MOVE` | `1` | write the movement vector (`0` = observe only) |
 | `BG3LE_SUPPRESS` | `1` | hide WASD from the game's own hotkey handling |
-| `BG3LE_INJECT` | `0` | fallback: synthesise gamepad stick events instead |
+| `BG3LE_VERBOSE` | `0` | also log from non-game processes (Steam's helpers) |
+| `BG3LE_FORCE` | `0` | write even if the engine looks uninitialised |
+
+## Why the log is quiet now
+
+Steam re-execs through a chain of helper processes and every one of them inherits `LD_PRELOAD`,
+so early logs were mostly helpers being correctly rejected. The library now identifies its host
+first — a BG3-sized symbol table **and** the movement signature must both be present — and stays
+out of the log entirely otherwise. `BG3LE_VERBOSE=1` brings the noise back if you need it.
+
+Writes are gated on the engine having actually started: the library reads live ECS type indices
+through the symbol table, and refuses to write while they are still zero. `BG3LE_FORCE=1`
+overrides that, but there should be no reason to.
 
 ## Rebuilding
 

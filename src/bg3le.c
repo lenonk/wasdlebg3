@@ -1,17 +1,23 @@
 /* bg3le — native Linux script extender for Baldur's Gate 3.
  *
- * Loaded with LD_PRELOAD. The whole input design rests on one verified fact:
+ * Loaded with LD_PRELOAD. The input design rests on one verified fact:
  * SDL_PollEvent is the game's only event ingress. It imports no SDL_PeepEvents,
  * SDL_WaitEvent, SDL_AddEventWatch, SDL_SetEventFilter or SDL_GetKeyboardState,
  * so every keystroke, mouse motion and controller axis the game will ever see
  * passes through the one function below. That makes suppression and injection
- * exact rather than best-effort.
+ * exact rather than best-effort, and gives us a once-per-frame main-thread tick.
+ *
+ * Steam re-execs through a chain of helper processes and every one of them
+ * inherits LD_PRELOAD, so the first thing we do is establish whether this
+ * process is actually the game and go quiet if it is not.
  *
  * Configuration is by environment variable so it can be set from a Steam launch
  * option without a config file:
  *   BG3LE_LOG=<path>     append a log here (default: stderr)
- *   BG3LE_SUPPRESS=0|1   swallow WASD before the game's hotkey layer sees it
- *   BG3LE_INJECT=0|1     synthesise left-stick axis motion from held WASD keys
+ *   BG3LE_MOVE=0|1       drive movement from WASD          (default 1)
+ *   BG3LE_SUPPRESS=0|1   hide WASD from the game's hotkeys (default 1)
+ *   BG3LE_VERBOSE=0|1    also log from non-game processes  (default 0)
+ *   BG3LE_FORCE=0|1      write even if the engine looks uninitialised (default 0)
  */
 #define _GNU_SOURCE
 #include "sigscan.h"
@@ -27,24 +33,32 @@
 #include <string.h>
 #include <time.h>
 
-#define MAX_INJECT 16
+/* A real BG3 build carries ~152k symbols; helper binaries carry a few thousand. */
+#define BG3_MIN_SYMBOLS 100000
+#define HEARTBEAT_FRAMES 600
 
 static int (*real_poll)(SDL_Event *);
 
 static FILE *g_logf;
-static int cfg_suppress, cfg_inject, cfg_move;
+static int cfg_suppress, cfg_move, cfg_verbose, cfg_force;
 
-/* Set once the override signature is located in the host's code. */
+static int g_is_bg3;
 static bg3_move_sig g_sig;
 static int g_have_sig;
 static bg3_move_ctl g_ctl;
 static int g_have_ctl;
 
-/* Held-state of the movement keys, maintained even when we swallow the events. */
-static struct { int w, a, s, d; } held;
+/* Live ECS type indices, read through the symbol table. They are zero until the
+ * engine registers its component types, which makes them a reliable "is the game
+ * actually up?" signal — and a gate on writing anything. */
+static const volatile uint32_t *g_ti_character;
+static const volatile uint32_t *g_ti_movement;
 
-static SDL_Event inject_q[MAX_INJECT];
-static int inject_n;
+static unsigned long g_frames;
+static int g_announced_live;
+
+/* Held state of the movement keys, maintained even when we swallow the events. */
+static struct { int w, a, s, d; } held;
 
 static int envflag(const char *k, int dflt)
 {
@@ -67,66 +81,6 @@ static void lg(const char *fmt, ...)
     fflush(g_logf);
 }
 
-/* Returns 1 if the event should be hidden from the game. */
-static int intercept(const SDL_Event *ev)
-{
-    if (ev->type != SDL_KEYDOWN && ev->type != SDL_KEYUP)
-        return 0;
-    if (ev->key.repeat)
-        return cfg_suppress && held.w + held.a + held.s + held.d > 0;
-
-    int down = (ev->type == SDL_KEYDOWN);
-    int *slot = NULL;
-    switch (ev->key.keysym.scancode) {
-    case SDL_SCANCODE_W: slot = &held.w; break;
-    case SDL_SCANCODE_A: slot = &held.a; break;
-    case SDL_SCANCODE_S: slot = &held.s; break;
-    case SDL_SCANCODE_D: slot = &held.d; break;
-    default: return 0;
-    }
-    if (*slot != down) {
-        *slot = down;
-        lg("movement key %s %s   -> vector (%+d,%+d)",
-           SDL_GetScancodeName(ev->key.keysym.scancode), down ? "down" : "up",
-           held.d - held.a, held.s - held.w);
-    }
-    return cfg_suppress;
-}
-
-/* Turn held keys into a left-stick deflection. This is the prototype of the
- * virtual-gamepad path: the game already knows how to move a character from
- * analog stick input, so if this reaches its controller code we get real
- * direct movement without touching any internal game state. */
-static void queue_axis_events(void)
-{
-    if (!cfg_inject) return;
-    int x = held.d - held.a, y = held.s - held.w;
-    /* Normalise a diagonal so it is not faster than a cardinal. */
-    double mag = (x && y) ? 0.7071 : 1.0;
-    Sint16 ax = (Sint16)(x * 32767 * mag), ay = (Sint16)(y * 32767 * mag);
-
-    static Sint16 last_x, last_y;
-    if (ax == last_x && ay == last_y) return;
-    last_x = ax;
-    last_y = ay;
-
-    struct { Uint8 axis; Sint16 val; } out[2] = {
-        {SDL_CONTROLLER_AXIS_LEFTX, ax},
-        {SDL_CONTROLLER_AXIS_LEFTY, ay},
-    };
-    for (int i = 0; i < 2 && inject_n < MAX_INJECT; i++) {
-        SDL_Event e;
-        memset(&e, 0, sizeof e);
-        e.type = SDL_CONTROLLERAXISMOTION;
-        e.caxis.timestamp = SDL_GetTicks();
-        e.caxis.which = 0;
-        e.caxis.axis = out[i].axis;
-        e.caxis.value = out[i].val;
-        inject_q[inject_n++] = e;
-    }
-    lg("injecting left-stick (%d,%d)", ax, ay);
-}
-
 struct exec_range { const uint8_t *code; size_t len; uintptr_t va; };
 
 /* The first object dl_iterate_phdr reports is the main executable. We want its
@@ -147,27 +101,53 @@ static int exec_range_cb(struct dl_phdr_info *info, size_t sz, void *data)
     return 1;
 }
 
-static void scan_host_for_override(void)
+/* Two independent tests must agree before we touch anything: the host has a
+ * BG3-sized symbol table, and the movement override is present in its code. */
+static void identify_host(void)
 {
+    char err[256] = {0};
+    sr_ctx *c = sr_open_self(err, sizeof err);
+    size_t nsym = c ? sr_count(c) : 0;
+
     struct exec_range r = {0};
     dl_iterate_phdr(exec_range_cb, &r);
-    if (!r.code) {
-        lg("no executable segment found — movement disabled");
+    int rc = r.code ? bg3_find_move_sig(r.code, r.len, r.va, &g_sig) : 0;
+
+    g_have_sig = (rc == 1);
+    g_is_bg3 = g_have_sig && nsym >= BG3_MIN_SYMBOLS;
+
+    if (!g_is_bg3) {
+        if (cfg_verbose)
+            lg("not the game (%zu symbols, signature rc=%d) — idle", nsym, rc);
+        else
+            g_logf = NULL;   /* stay out of the log entirely */
+        if (c) sr_close(c);
         return;
     }
 
-    int rc = bg3_find_move_sig(r.code, r.len, r.va, &g_sig);
-    if (rc == 1) {
-        g_have_sig = 1;
-        lg("override signature @%#lx: global %#lx, vec +%#x, flag +%#x",
-           g_sig.match_va, g_sig.global_slot, g_sig.vec_off, g_sig.flag_off);
-    } else if (rc < 0) {
-        /* Refusing beats writing to a global we guessed at. */
-        lg("override signature is AMBIGUOUS — movement disabled");
-    } else {
-        lg("override signature not found in %zu KB — not BG3, or the build moved on",
-           r.len / 1024);
-    }
+    lg("BG3 identified: %zu symbols, load bias %#lx", nsym, sr_bias(c));
+    lg("override @%#lx: state ptr @%#lx, vec +%#x, flag +%#x",
+       g_sig.match_va, g_sig.global_slot, g_sig.vec_off, g_sig.flag_off);
+    if (rc < 0)
+        lg("WARNING: signature was ambiguous — refusing to write");
+
+    /* Resolve the ECS probes now, but read them later: at constructor time the
+     * engine has not registered its types yet and every index is still zero. */
+    sr_req probe[] = {
+        {"_ZN2ls6TypeIdIN3ecl9CharacterEN3ecs22ComponentTypeIdContextEE11m_TypeIndexE", 0, 0},
+        {"_ZN2ls6TypeIdIN3eoc17MovementComponentEN3ecs22ComponentTypeIdContextEE11m_TypeIndexE", 0, 0},
+    };
+    sr_resolve_many(c, probe, 2);
+    g_ti_character = (const volatile uint32_t *)probe[0].addr;
+    g_ti_movement = (const volatile uint32_t *)probe[1].addr;
+    lg("ECS probes: ecl::Character @%#lx, eoc::MovementComponent @%#lx",
+       (unsigned long)probe[0].addr, (unsigned long)probe[1].addr);
+    sr_close(c);
+}
+
+static int engine_ready(void)
+{
+    return (g_ti_character && *g_ti_character) || (g_ti_movement && *g_ti_movement);
 }
 
 /* Hand the game a movement vector directly, instead of letting it poll the four
@@ -176,25 +156,45 @@ static void scan_host_for_override(void)
  * vector into world space using the live camera. So what we write is
  * camera-relative — which is precisely what WASD means — and the character walks
  * through the ordinary locomotion, animation and collision path. */
-static void drive_movement(void)
+static void tick(void)
 {
-    if (!cfg_move || !g_have_sig)
-        return;
+    if (!g_is_bg3) return;
+    g_frames++;
 
-    /* The state block is allocated during startup, so this is null for a while. */
-    if (!g_have_ctl) {
-        if (!bg3_move_ctl_resolve(&g_sig, &g_ctl))
-            return;
-        g_have_ctl = 1;
-        lg("movement control live: vec @%p flag @%p", (void *)g_ctl.vec, (void *)g_ctl.flag);
+    if (!g_have_ctl && g_have_sig) {
+        /* The state block is allocated during startup, so this is null for a while. */
+        if (bg3_move_ctl_resolve(&g_sig, &g_ctl)) {
+            g_have_ctl = 1;
+            lg("state block resolved on frame %lu: vec @%p flag @%p (flag currently %u)",
+               g_frames, (void *)g_ctl.vec, (void *)g_ctl.flag, *g_ctl.flag);
+        }
     }
+
+    if (!g_announced_live && engine_ready()) {
+        g_announced_live = 1;
+        lg("engine initialised on frame %lu — ECS indices: Character=%u Movement=%u",
+           g_frames, g_ti_character ? *g_ti_character : 0,
+           g_ti_movement ? *g_ti_movement : 0);
+    }
+
+    if (g_frames % HEARTBEAT_FRAMES == 0)
+        lg("frame %lu: block=%s engine=%s ecs(%u,%u) keys(w%d a%d s%d d%d)",
+           g_frames, g_have_ctl ? "live" : "null", engine_ready() ? "up" : "waiting",
+           g_ti_character ? *g_ti_character : 0, g_ti_movement ? *g_ti_movement : 0,
+           held.w, held.a, held.s, held.d);
+
+    if (!cfg_move || !g_have_ctl)
+        return;
+    /* Refuse to write into a game that has not finished starting up. */
+    if (!engine_ready() && !cfg_force)
+        return;
 
     int x = held.d - held.a, y = held.s - held.w;
     if (!x && !y) {
         /* Leaving the flag set with a stale vector walks the character forever. */
         if (*g_ctl.flag) {
             *g_ctl.flag = 0;
-            lg("movement released");
+            lg("movement released (frame %lu)", g_frames);
         }
         return;
     }
@@ -202,7 +202,36 @@ static void drive_movement(void)
     double mag = (x && y) ? 0.70710678 : 1.0;
     g_ctl.vec[0] = (float)(x * mag);
     g_ctl.vec[1] = (float)(y * mag);
+    if (!*g_ctl.flag)
+        lg("movement engaged (frame %lu) vec=(%.3f, %.3f)",
+           g_frames, (double)g_ctl.vec[0], (double)g_ctl.vec[1]);
     *g_ctl.flag = 1;
+}
+
+/* Returns 1 if the event should be hidden from the game. */
+static int intercept(const SDL_Event *ev)
+{
+    if (ev->type != SDL_KEYDOWN && ev->type != SDL_KEYUP)
+        return 0;
+    if (ev->key.repeat)
+        return cfg_suppress && held.w + held.a + held.s + held.d > 0;
+
+    int down = (ev->type == SDL_KEYDOWN);
+    int *slot = NULL;
+    switch (ev->key.keysym.scancode) {
+    case SDL_SCANCODE_W: slot = &held.w; break;
+    case SDL_SCANCODE_A: slot = &held.a; break;
+    case SDL_SCANCODE_S: slot = &held.s; break;
+    case SDL_SCANCODE_D: slot = &held.d; break;
+    default: return 0;
+    }
+    if (*slot != down) {
+        *slot = down;
+        lg("key %s %s -> vector (%+d,%+d)",
+           SDL_GetScancodeName(ev->key.keysym.scancode), down ? "down" : "up",
+           held.d - held.a, held.s - held.w);
+    }
+    return cfg_suppress;
 }
 
 int SDL_PollEvent(SDL_Event *ev)
@@ -216,24 +245,25 @@ int SDL_PollEvent(SDL_Event *ev)
     }
 
     for (;;) {
-        if (inject_n > 0) {
-            *ev = inject_q[0];
-            memmove(inject_q, inject_q + 1, (size_t)(--inject_n) * sizeof *inject_q);
-            return 1;
-        }
         int r = real_poll(ev);
         if (!r) {
             /* The game drains events until this returns 0, so here we are exactly
              * once per frame, on the main thread, before the frame is simulated. */
-            drive_movement();
+            tick();
             return 0;
         }
-        if (intercept(ev)) {
-            queue_axis_events();
-            continue; /* swallowed — hand the game the next event instead */
-        }
-        queue_axis_events();
+        if (intercept(ev))
+            continue;  /* swallowed — hand the game the next event instead */
         return 1;
+    }
+}
+
+/* Losing focus with keys held would otherwise leave the character walking. */
+__attribute__((destructor)) static void bg3le_fini(void)
+{
+    if (g_have_ctl && *g_ctl.flag) {
+        *g_ctl.flag = 0;
+        lg("cleared movement flag on unload");
     }
 }
 
@@ -243,34 +273,11 @@ __attribute__((constructor)) static void bg3le_init(void)
     g_logf = path ? fopen(path, "ae") : stderr;
     if (!g_logf) g_logf = stderr;
     cfg_suppress = envflag("BG3LE_SUPPRESS", 1);
-    cfg_inject = envflag("BG3LE_INJECT", 0);
     cfg_move = envflag("BG3LE_MOVE", 1);
+    cfg_verbose = envflag("BG3LE_VERBOSE", 0);
+    cfg_force = envflag("BG3LE_FORCE", 0);
 
-    lg("loaded (suppress=%d move=%d inject=%d)", cfg_suppress, cfg_move, cfg_inject);
-    scan_host_for_override();
-
-    char err[256] = {0};
-    sr_ctx *c = sr_open_self(err, sizeof err);
-    if (!c) {
-        lg("symres unavailable: %s  (fine outside the game)", err);
-        return;
-    }
-    lg("host: %zu symbols, load bias %#lx", sr_count(c), sr_bias(c));
-
-    /* If we are inside BG3 these resolve; anywhere else they do not, which is
-     * exactly how we detect the host without hardcoding a path. */
-    sr_req probe[] = {
-        {"_ZN2ls6TypeIdIN3ecl9CharacterEN3ecs22ComponentTypeIdContextEE11m_TypeIndexE", 0, 0},
-        {"_ZN2ls6TypeIdIN3eoc17MovementComponentEN3ecs22ComponentTypeIdContextEE11m_TypeIndexE", 0, 0},
-    };
-    size_t n = sizeof probe / sizeof *probe;
-    if (sr_resolve_many(c, probe, n) == 0) {
-        lg("host is not BG3 — input shim active, game hooks idle");
-    } else {
-        for (size_t i = 0; i < n; i++)
-            if (probe[i].addr)
-                lg("ECS type index @%#lx = %u  (%.70s)", probe[i].addr,
-                   *(unsigned *)probe[i].addr, probe[i].name);
-    }
-    sr_close(c);
+    identify_host();
+    if (g_is_bg3)
+        lg("armed (move=%d suppress=%d force=%d)", cfg_move, cfg_suppress, cfg_force);
 }
