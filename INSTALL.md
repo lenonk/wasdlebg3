@@ -21,8 +21,12 @@ If you only find `bg3.exe`, that's the Windows build.
 ## 2. Pre-flight check (no launching, completely safe)
 
 ```sh
-./bg3le-check "/path/to/Baldurs Gate 3/bin/bg3"
+./bg3le-check "/path/to/Baldurs Gate 3"
 ```
+
+Give it either the game folder or the executable itself — handed a folder, it goes and finds
+`bin/bg3`. **Quote the path**: "Baldurs Gate 3" has spaces in it, and an unquoted path gets
+chopped up by the shell before the tool ever sees it.
 
 You want to see `GOOD — this build is supported`, along with a build id, a version, and three
 derived addresses. **Send me this output either way.** If it says NOT FOUND, your build differs

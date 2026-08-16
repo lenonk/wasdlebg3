@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -67,25 +68,72 @@ static void print_version(const Elf64_Ehdr *eh)
     }
 }
 
+/* Being handed the game folder instead of the executable is the obvious mistake,
+ * so just accept it and go find the binary. */
+static const char *resolve_target(const char *in, char *buf, size_t buflen)
+{
+    struct stat st;
+    if (stat(in, &st) != 0) {
+        fprintf(stderr, "\n  Cannot open: %s\n  %s\n\n", in, strerror(errno));
+        if (strchr(in, ' ') == NULL)
+            fprintf(stderr, "  If the real path contains spaces, wrap it in \"quotes\".\n\n");
+        return NULL;
+    }
+    if (!S_ISDIR(st.st_mode))
+        return in;
+
+    size_t n = strlen(in);
+    while (n > 1 && in[n - 1] == '/') n--;   /* tolerate a trailing slash */
+
+    static const char *where[] = {"bin/bg3", "bg3", "bin/bg3.exe", "bg3.exe"};
+    for (size_t i = 0; i < sizeof where / sizeof *where; i++) {
+        snprintf(buf, buflen, "%.*s/%s", (int)n, in, where[i]);
+        if (stat(buf, &st) == 0 && S_ISREG(st.st_mode)) {
+            printf("  (that's a folder — using %s)\n", where[i]);
+            return buf;
+        }
+    }
+    fprintf(stderr,
+            "\n  That is a folder, and it contains no bg3 executable in the usual\n"
+            "  places (bin/bg3 or ./bg3). Try:\n\n"
+            "    ls \"%.*s/bin/\"\n\n", (int)n, in);
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
         fprintf(stderr,
-                "usage: bg3le-check /path/to/Baldurs Gate 3/bin/bg3\n\n"
-                "Checks whether this build of BG3 contains the movement override\n"
-                "that bg3le drives, and prints the addresses it derives.\n");
+                "usage: bg3le-check \"<path to BG3>\"\n\n"
+                "Accepts either the executable or the game folder:\n"
+                "  bg3le-check \"~/SteamLibrary/steamapps/common/Baldurs Gate 3\"\n"
+                "  bg3le-check \"~/SteamLibrary/steamapps/common/Baldurs Gate 3/bin/bg3\"\n\n"
+                "Quote the path — it contains spaces. Nothing is launched or modified.\n");
         return 2;
     }
-    int fd = open(argv[1], O_RDONLY);
-    if (fd < 0) { perror(argv[1]); return 2; }
+
+    char resolved[4096];
+    const char *target = resolve_target(argv[1], resolved, sizeof resolved);
+    if (!target) return 2;
+
+    int fd = open(target, O_RDONLY);
+    if (fd < 0) { perror(target); return 2; }
     struct stat st;
     fstat(fd, &st);
     g_len = st.st_size;
+    if (g_len == 0) {
+        fprintf(stderr, "\n  %s is empty.\n\n", target);
+        close(fd);
+        return 2;
+    }
     g_map = mmap(NULL, g_len, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
-    if (g_map == MAP_FAILED) { perror("mmap"); return 2; }
+    if (g_map == MAP_FAILED) {
+        fprintf(stderr, "\n  Cannot read %s: %s\n\n", target, strerror(errno));
+        return 2;
+    }
 
-    printf("\n=== %s ===\n", argv[1]);
+    printf("\n=== %s ===\n", target);
     printf("  size          : %.1f MB\n", g_len / 1048576.0);
 
     if (g_len < sizeof(Elf64_Ehdr) || memcmp(g_map, ELFMAG, SELFMAG)) {
