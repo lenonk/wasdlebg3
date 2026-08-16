@@ -33,8 +33,6 @@
 #include <string.h>
 #include <time.h>
 
-/* A real BG3 build carries ~152k symbols; helper binaries carry a few thousand. */
-#define BG3_MIN_SYMBOLS 100000
 #define HEARTBEAT_FRAMES 600
 
 static int (*real_poll)(SDL_Event *);
@@ -101,52 +99,65 @@ static int exec_range_cb(struct dl_phdr_info *info, size_t sz, void *data)
     return 1;
 }
 
-/* Two independent tests must agree before we touch anything: the host has a
- * BG3-sized symbol table, and the movement override is present in its code. */
+/* The signature scan is the identifying test, and deliberately the only one:
+ * it reads mapped memory and cannot fail for environmental reasons. Reading the
+ * symbol table needs /proc/self/exe and a readable game file, which may not hold
+ * inside Steam's container — so symbols are a bonus, never a gate. An earlier
+ * version required both, and a symbol-table failure silently disabled everything. */
 static void identify_host(void)
 {
-    char err[256] = {0};
-    sr_ctx *c = sr_open_self(err, sizeof err);
-    size_t nsym = c ? sr_count(c) : 0;
-
     struct exec_range r = {0};
     dl_iterate_phdr(exec_range_cb, &r);
     int rc = r.code ? bg3_find_move_sig(r.code, r.len, r.va, &g_sig) : 0;
 
     g_have_sig = (rc == 1);
-    g_is_bg3 = g_have_sig && nsym >= BG3_MIN_SYMBOLS;
+    g_is_bg3 = g_have_sig;
 
     if (!g_is_bg3) {
         if (cfg_verbose)
-            lg("not the game (%zu symbols, signature rc=%d) — idle", nsym, rc);
+            lg("not the game (%zu KB of code, signature rc=%d) — idle", r.len / 1024, rc);
         else
             g_logf = NULL;   /* stay out of the log entirely */
-        if (c) sr_close(c);
         return;
     }
 
-    lg("BG3 identified: %zu symbols, load bias %#lx", nsym, sr_bias(c));
-    lg("override @%#lx: state ptr @%#lx, vec +%#x, flag +%#x",
-       g_sig.match_va, g_sig.global_slot, g_sig.vec_off, g_sig.flag_off);
-    if (rc < 0)
-        lg("WARNING: signature was ambiguous — refusing to write");
+    lg("BG3 identified by signature @%#lx", g_sig.match_va);
+    lg("state ptr @%#lx, vec +%#x, flag +%#x",
+       g_sig.global_slot, g_sig.vec_off, g_sig.flag_off);
 
-    /* Resolve the ECS probes now, but read them later: at constructor time the
-     * engine has not registered its types yet and every index is still zero. */
+    /* Best effort from here on. Resolve the ECS probes now but read them later:
+     * at constructor time the engine has not registered its types yet, so every
+     * index is still zero and tells us nothing. */
+    char err[256] = {0};
+    sr_ctx *c = sr_open_self(err, sizeof err);
+    if (!c) {
+        lg("symbols unavailable (%s) — continuing without the engine-ready gate", err);
+        return;
+    }
+    lg("symbols: %zu, load bias %#lx", sr_count(c), sr_bias(c));
+
     sr_req probe[] = {
         {"_ZN2ls6TypeIdIN3ecl9CharacterEN3ecs22ComponentTypeIdContextEE11m_TypeIndexE", 0, 0},
         {"_ZN2ls6TypeIdIN3eoc17MovementComponentEN3ecs22ComponentTypeIdContextEE11m_TypeIndexE", 0, 0},
     };
-    sr_resolve_many(c, probe, 2);
-    g_ti_character = (const volatile uint32_t *)probe[0].addr;
-    g_ti_movement = (const volatile uint32_t *)probe[1].addr;
-    lg("ECS probes: ecl::Character @%#lx, eoc::MovementComponent @%#lx",
-       (unsigned long)probe[0].addr, (unsigned long)probe[1].addr);
+    if (sr_resolve_many(c, probe, 2) == 0) {
+        lg("ECS probe symbols not found — continuing without the engine-ready gate");
+    } else {
+        g_ti_character = (const volatile uint32_t *)probe[0].addr;
+        g_ti_movement = (const volatile uint32_t *)probe[1].addr;
+        lg("ECS probes @%#lx and @%#lx",
+           (unsigned long)probe[0].addr, (unsigned long)probe[1].addr);
+    }
     sr_close(c);
 }
 
+static int have_probes(void) { return g_ti_character || g_ti_movement; }
+
+/* True once the engine has registered its component types. Without probes we
+ * cannot tell, so we say yes and rely on the state-block pointer instead. */
 static int engine_ready(void)
 {
+    if (!have_probes()) return 1;
     return (g_ti_character && *g_ti_character) || (g_ti_movement && *g_ti_movement);
 }
 
@@ -170,7 +181,7 @@ static void tick(void)
         }
     }
 
-    if (!g_announced_live && engine_ready()) {
+    if (!g_announced_live && have_probes() && engine_ready()) {
         g_announced_live = 1;
         lg("engine initialised on frame %lu — ECS indices: Character=%u Movement=%u",
            g_frames, g_ti_character ? *g_ti_character : 0,
