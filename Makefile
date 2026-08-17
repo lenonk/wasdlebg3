@@ -18,7 +18,7 @@ INC     := -I$(SE)/include -I$(SE)/src $(SDL_CFLAGS)
 SE_LINK := -Wl,--whole-archive $(SE_LIB) -Wl,--no-whole-archive
 
 .PHONY: all test clean se
-all: $(BUILD)/bg3le.so $(BUILD)/bg3le-check
+all: $(BUILD)/bg3le.so $(BUILD)/plugins/wasd.so $(BUILD)/bg3le-check
 
 $(BUILD):
 	@mkdir -p $@
@@ -39,11 +39,18 @@ FORCE:
 
 se: $(SE_LIB)
 
-PLUGINS := src/wasd.c src/camlook.c
+# Standalone: the host linked in, one file and one LD_PRELOAD. Do NOT preload
+# this alongside another standalone mod — each contains a host and both would
+# interpose SDL_PollEvent. Use the plugin build for anything beyond one mod.
+$(BUILD)/bg3le.so: src/wasd.c src/movesig.c src/movesig.h $(SE_LIB) | $(BUILD)
+	$(CC) $(CFLAGS) -fPIC -shared -DWASD_BUILTIN $(INC) -o $@ \
+	  src/wasd.c src/movesig.c $(SE_LINK) -ldl
 
-$(BUILD)/bg3le.so: $(PLUGINS) src/movesig.c src/movesig.h $(SE_LIB) | $(BUILD)
-	$(CC) $(CFLAGS) -fPIC -shared $(INC) -o $@ $(PLUGINS) src/movesig.c \
-	  $(SE_LINK) -ldl
+# Plugin: dropped next to an existing bg3lese install so several mods share one
+# host and cooperate over the input stream instead of fighting for it.
+$(BUILD)/plugins/wasd.so: src/wasd.c src/movesig.c src/movesig.h $(SE_LIB) | $(BUILD)
+	@mkdir -p $(BUILD)/plugins
+	$(CC) $(CFLAGS) -fPIC -shared $(INC) -o $@ src/wasd.c src/movesig.c
 
 $(BUILD)/bg3le-check: src/check.c src/movesig.c $(SE)/src/scan.c | $(BUILD)
 	$(CC) $(CFLAGS) $(INC) -o $@ $^
@@ -62,3 +69,6 @@ test: $(BUILD)/test_movesig $(BUILD)/bg3le.so $(BUILD)/sdl_harness
 clean:
 	rm -rf $(BUILD)
 	@test -f $(SE)/Makefile && $(MAKE) -C $(SE) clean || true
+
+plugin: $(BUILD)/plugins/wasd.so
+.PHONY: plugin

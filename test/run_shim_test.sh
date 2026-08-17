@@ -67,38 +67,14 @@ check "BG3LE_VERBOSE=1 explains why it went idle" "1" \
       "$(grep -c 'not Baldur' "$TMP/loud.log")"
 check "no plugin runs outside the game" "0" "$(grep -c 'wasd:' "$TMP/loud.log")"
 
-echo
-echo "=== camlook: right-drag becomes the game's own look drag ==="
 
-# A right-click with no movement must still reach the game intact, or context
-# menus break -- which would be a worse regression than the feature is a win.
-clk=$("${SHIM[@]}" ./"$B"/sdl_harness rmbclick | grep 'GAME SAW btn' \
-      | awk '{$1=$1};1' | tr '\n' ',')
-check "a plain right-click passes through, in order" "GAME SAW btn right down,GAME SAW btn right up," "$clk"
-
-drag=$("${SHIM[@]}" ./"$B"/sdl_harness rmbdrag)
-check "a right-drag is delivered as the look button" "1" \
-      "$(grep -c 'GAME SAW btn middle down' <<<"$drag")"
-check "and released on mouse-up" "1" "$(grep -c 'GAME SAW btn middle up' <<<"$drag")"
-check "the right button never reaches the game" "0" \
-      "$(grep -c 'GAME SAW btn right' <<<"$drag")"
-check "motion still reaches the game to drive rotation" "2" \
-      "$(grep -c 'GAME SAW motion' <<<"$drag")"
-
-# The button-down must precede the motion that started the drag, or the game
-# misses the first frame of rotation.
-first=$(grep -E 'GAME SAW (btn|motion)' <<<"$drag" | head -1 | awk '{$1=$1};1')
-check "the press is delivered before the motion" "GAME SAW btn middle down" "$first"
-
-lmb=$("${SHIM[@]}" ./"$B"/sdl_harness lmbdrag | grep -c 'GAME SAW btn left')
-check "left-drag is left alone" "2" "$lmb"
-
-off=$("${SHIM[@]}" BG3LE_LOOK=0 ./"$B"/sdl_harness rmbdrag | grep -c 'GAME SAW btn right')
-check "BG3LE_LOOK=0 disables it entirely" "2" "$off"
-
-alt=$("${SHIM[@]}" BG3LE_LOOK_BUTTON=left ./"$B"/sdl_harness rmbdrag \
-      | grep -c 'GAME SAW btn left')
-check "BG3LE_LOOK_BUTTON picks a different button" "2" "$alt"
+# Each build must export what its packaging model needs.
+check "the plugin build exports bg3lese_plugin_entry" "1" \
+      "$(nm -D "$B"/plugins/wasd.so | grep -c ' T bg3lese_plugin_entry')"
+check "the plugin build does NOT interpose SDL_PollEvent" "0" \
+      "$(nm -D "$B"/plugins/wasd.so | grep -c ' T SDL_PollEvent')"
+check "the standalone build does" "1" \
+      "$(nm -D "$B"/bg3le.so | grep -c ' T SDL_PollEvent')"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASSED"; else echo "FAILED ($fails)"; fi

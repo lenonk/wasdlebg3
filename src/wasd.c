@@ -281,4 +281,11 @@ static const bg3lese_plugin wasd_plugin = {
     .on_frame = wasd_on_frame,
     .shutdown = wasd_shutdown,
 };
+/* The same source serves both packaging models. As a dynamic plugin it exports
+ * the entry point and is dlopen'd by a shared host, which is how it coexists
+ * with other mods. Built in, it is linked into a single self-contained .so. */
+#ifdef WASD_BUILTIN
 BG3LESE_BUILTIN(wasd_plugin);
+#else
+const bg3lese_plugin *bg3lese_plugin_entry(void) { return &wasd_plugin; }
+#endif
