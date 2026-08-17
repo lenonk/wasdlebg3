@@ -1,0 +1,3 @@
+[submodule "vendor/bg3lese"]
+	path = vendor/bg3lese
+	url = https://github.com/Nerocon/bg3lese.git

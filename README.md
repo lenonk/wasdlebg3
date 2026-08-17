@@ -10,7 +10,11 @@ synthesised mouse clicks. Movement is camera-relative: forward means away from t
 Ships as a single `LD_PRELOAD` library, `bg3le.so`. It patches nothing on disk and leaves
 no trace after you quit.
 
-> **Status:** working and in use, but young. Version 0.1.0. Single-player only — see
+Built on [**bg3lese**](https://github.com/Nerocon/bg3lese), a script-extender host for
+native-Linux BG3. This is its first plugin; the extender is statically linked in, so
+there is still only one file to install.
+
+> **Status:** working and in use. Version 0.2.0. Single-player only — see
 > [Scope and safety](#scope-and-safety).
 
 ---
@@ -37,11 +41,14 @@ prints everything needed to add support for another build.
 ## Install
 
 ```sh
-git clone https://github.com/Nerocon/wasdlebg3
+git clone --recursive https://github.com/Nerocon/wasdlebg3
 cd wasdlebg3
 make
 ./install.sh
 ```
+
+(`--recursive` pulls in the extender. If you forget, `make` runs
+`git submodule update --init` for you.)
 
 `install.sh` copies the library to `~/.local/share/bg3le/` and prints the exact Steam
 launch options to paste. Or do it by hand:
@@ -86,6 +93,7 @@ are what you want; the rest are for troubleshooting.
 | `BG3LE_SUPPRESS` | `1` | hide WASD from the game's own bindings |
 | `BG3LE_MOVE` | `1` | drive movement (`0` = observe only) |
 | `BG3LE_GATE` | `1` | open the game's controller-mode gate (`0` disables the mod) |
+| `BG3LE_INPUT_ONLY` | `0` | filter input without moving, for diagnosing an unrecognised build |
 | `BG3LE_LOG` | `/tmp/bg3le.log` | log file |
 | `BG3LE_TRACE` | `0` | per-keystroke and per-frame detail |
 | `BG3LE_VERBOSE` | `0` | also log from Steam's helper processes |
@@ -135,28 +143,28 @@ rolls, speed beyond the game's own run speed, or anything the server validates.
 
 ## How it works
 
-Three facts about the binary carry the whole design, each verified against it:
+The extender half — interposing `SDL_PollEvent`, resolving symbols, scanning for patterns
+and patching safely — is [bg3lese](https://github.com/Nerocon/bg3lese) and documented
+there. What follows is what belongs to *this* mod.
 
-1. **`SDL_PollEvent` is the game's only input ingress.** It imports no `SDL_PeepEvents`,
-   `SDL_WaitEvent`, `SDL_AddEventWatch`, `SDL_SetEventFilter`, not even
-   `SDL_GetKeyboardState` — and it has exactly one call site. Interposing that one function
-   gives exact control of every keystroke plus a once-per-frame main-thread tick.
+Two facts about the binary carry it, each verified against it:
 
-2. **A forced-input override already exists.** The movement-input fetch checks it *before*
+1. **A forced-input override already exists.** The movement-input fetch checks it *before*
    polling `CharacterMoveForward/Backward/Left/Right`, and it is consumed upstream of the
    deadzone, normalise and camera rotation. So we write a camera-relative vector exactly
    like stick deflection — and because magnitudes below 1.0 survive the normalise step, a
    shorter vector is a genuine walk rather than a clamped run.
 
-3. **That path is gated by one branch.** A `cmp`/`je` on a controller-mode flag skips it
+2. **That path is gated by one branch.** A `cmp`/`je` on a controller-mode flag skips it
    entirely outside controller mode. Writing the flag loses a per-frame race against the
    engine's input-mode arbiter — measured, it reset ours on every single frame — so the
    six-byte branch is NOPed instead, as a single aligned atomic store.
 
-**No addresses are hardcoded.** At load time the library finds its signature, recovers the
+**No addresses are hardcoded.** At load time the plugin finds its signature, recovers the
 global and both field offsets from instruction encodings, derives the mode flag from call
-sites, and locates the gate branch. If anything fails to match it refuses to touch memory.
-That is what should carry it across game patches.
+sites, and locates the gate branch. If anything fails to match it declines to load and
+your keys go to the game untouched — an unrecognised build gets no movement rather than
+swallowed input.
 
 `DESIGN.md` has the full reverse-engineering write-up, including which claims were verified
 directly and which remain assumptions. `analysis/` holds the tooling: a SQLite index of the
@@ -167,13 +175,14 @@ disassembly helpers.
 
 ```sh
 make          # builds build/bg3le.so and build/bg3le-check
-make test     # 41 assertions
+make test     # 23 assertions here, plus 54 in the extender
 ```
 
-The test suite needs **neither a copy of BG3 nor a display**. It exercises the symbol
-resolver against a live PIE, the signature scanner against a real binary if one is present,
-the inline hook against a local function reproducing BG3's exact prologue, and the input
-filter against a stand-in game using SDL's dummy drivers.
+The test suite needs **neither a copy of BG3 nor a display**. Here it covers the movement
+signature scan against a real binary if one is present, and the input filter against a
+stand-in game using SDL's dummy drivers. The extender's own suite — symbol resolution,
+hooking, the patch ledger, and the plugin dispatch contract — lives in
+[bg3lese](https://github.com/Nerocon/bg3lese) and runs with `make -C vendor/bg3lese test`.
 
 ## Prior art
 

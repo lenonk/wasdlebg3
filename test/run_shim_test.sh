@@ -8,7 +8,12 @@ fails=0
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-SHIM=(env BG3LE_LOG=/dev/null LD_PRELOAD=./"$B"/bg3le.so)
+# The extender identifies the game by its branding, and the plugin declines to
+# load without a movement signature — both correct in production, both false
+# here. FORCE_HOST makes the host dispatch; INPUT_ONLY makes the plugin filter
+# input without attempting to move anything.
+SHIM=(env BG3LE_LOG=/dev/null BG3LE_FORCE_HOST=1 BG3LE_INPUT_ONLY=1 \
+      LD_PRELOAD=./"$B"/bg3le.so)
 
 check() { # name expected actual
   if [ "$2" = "$3" ]; then
@@ -45,8 +50,9 @@ txt=$("${SHIM[@]}" ./"$B"/sdl_harness textinput | grep '^RESULT')
 check "WASD reaches the game while typing" "RESULT keys=4 other=0" "$txt"
 
 # Losing focus with a key held must not leave the character walking.
-foc=$("${SHIM[@]}" BG3LE_TRACE=1 BG3LE_VERBOSE=1 BG3LE_LOG="$TMP/f.log" ./"$B"/sdl_harness focus >/dev/null; \
-      grep -c 'focus lost' "$TMP/f.log")
+foc=$(env BG3LE_FORCE_HOST=1 BG3LE_INPUT_ONLY=1 BG3LE_TRACE=1 \
+      BG3LE_LOG="$TMP/f.log" LD_PRELOAD=./"$B"/bg3le.so \
+      ./"$B"/sdl_harness focus >/dev/null; grep -c 'focus lost' "$TMP/f.log")
 check "focus loss releases movement" "1" "$foc"
 
 # Steam re-execs through many helpers; loading into one must be silent.
@@ -58,9 +64,8 @@ check "silent in a non-game process" "0" "$(wc -l < "$TMP/quiet.log")"
 BG3LE_LOG="$TMP/loud.log" BG3LE_VERBOSE=1 LD_PRELOAD=./"$B"/bg3le.so \
   ./"$B"/sdl_harness >/dev/null 2>/dev/null
 check "BG3LE_VERBOSE=1 explains why it went idle" "1" \
-      "$(grep -c 'not the game' "$TMP/loud.log")"
-check "never claims to have identified BG3" "0" \
-      "$(grep -c 'BG3 identified' "$TMP/loud.log")"
+      "$(grep -c 'not Baldur' "$TMP/loud.log")"
+check "no plugin runs outside the game" "0" "$(grep -c 'wasd:' "$TMP/loud.log")"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASSED"; else echo "FAILED ($fails)"; fi

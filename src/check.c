@@ -6,7 +6,7 @@
  * is obvious rather than mysterious.
  */
 #define _GNU_SOURCE
-#include "sigscan.h"
+#include "movesig.h"
 
 #include <elf.h>
 #include <fcntl.h>
@@ -158,16 +158,35 @@ int main(int argc, char **argv)
     printf("  .rela.text    : %s\n",
            relatext ? "present (exact xref graph available)" : "absent");
 
-    bg3_move_sig sig;
+    move_sig sig;
     memset(&sig, 0, sizeof sig);
-    int r = bg3_find_move_sig(g_map + text->sh_offset, text->sh_size, text->sh_addr, &sig);
+    int r = move_find_sig(g_map + text->sh_offset, text->sh_size, text->sh_addr, &sig);
 
     printf("\n--- movement override ---\n");
     if (r == 1) {
+        const uint8_t *code = g_map + text->sh_offset;
         printf("  FOUND at        %#lx\n", (unsigned long)sig.match_va);
         printf("  state pointer @ %#lx\n", (unsigned long)sig.global_slot);
         printf("  forced vec2   + %#x\n", sig.vec_off);
         printf("  enable flag   + %#x\n", sig.flag_off);
+
+        /* A matching signature is not enough on its own: outside controller
+         * mode the game never asks for movement input, so without the gate the
+         * override is written and never read. Both must be present. */
+        uintptr_t flag = move_find_padmode_flag(code, text->sh_size,
+                                                text->sh_addr, sig.fetch_fn);
+        uintptr_t gates[8];
+        size_t ng = flag ? move_find_gates(code, text->sh_size, text->sh_addr,
+                                           sig.fetch_fn, flag, gates, 8) : 0;
+        printf("  mode flag     @ %#lx\n", (unsigned long)flag);
+        printf("  gate branches   %zu\n", ng);
+
+        if (!flag || !ng) {
+            printf("\n  PARTIAL — the override is there but the gate that gets it\n"
+                   "  read is not, so movement would stay dormant. Please send\n"
+                   "  this output back so the scan can be adjusted.\n\n");
+            return 1;
+        }
         printf("\n  GOOD — this build is supported. bg3le will drive movement\n"
                "  through the game's own analog-movement path.\n\n");
         return 0;

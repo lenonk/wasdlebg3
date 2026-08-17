@@ -1,7 +1,7 @@
 /* Runs the signature scanner over the real BG3 .text and checks it recovers the
  * global and both field offsets that were read by hand out of the disassembly. */
 #define _GNU_SOURCE
-#include "sigscan.h"
+#include "movesig.h"
 
 #include <elf.h>
 #include <fcntl.h>
@@ -48,9 +48,9 @@ int main(void)
              (unsigned long)text->sh_addr, (unsigned long)text->sh_size);
     ok(1, "located .text", buf);
 
-    bg3_move_sig sig;
+    move_sig sig;
     memset(&sig, 0, sizeof sig);
-    int r = bg3_find_move_sig(m + text->sh_offset, text->sh_size, text->sh_addr, &sig);
+    int r = move_find_sig(m + text->sh_offset, text->sh_size, text->sh_addr, &sig);
 
     snprintf(buf, sizeof buf, "returned %d", r);
     ok(r == 1, "found exactly one match in 90 MB of code", buf);
@@ -68,15 +68,18 @@ int main(void)
     snprintf(buf, sizeof buf, "%#x (expected 0x139c)", sig.flag_off);
     ok(sig.flag_off == 0x139c, "recovered the enable-flag offset", buf);
 
+    snprintf(buf, sizeof buf, "%#lx (expected 0x2c75c60)", (unsigned long)sig.fetch_fn);
+    ok(sig.fetch_fn == 0x2c75c60, "derived the fetch function entry", buf);
+
     /* The controller-mode flag must be derived, not hardcoded. */
-    uintptr_t fetch = sig.match_va - 10;
-    uintptr_t flag = bg3_find_padmode_flag(m + text->sh_offset, text->sh_size,
+    uintptr_t fetch = sig.fetch_fn;
+    uintptr_t flag = move_find_padmode_flag(m + text->sh_offset, text->sh_size,
                                            text->sh_addr, fetch);
     snprintf(buf, sizeof buf, "%#lx (expected 0x7d9d108)", (unsigned long)flag);
     ok(flag == 0x7d9d108, "derived the controller-mode flag from call sites", buf);
 
     uintptr_t gates[8];
-    size_t ng = bg3_find_move_gates(m + text->sh_offset, text->sh_size, text->sh_addr,
+    size_t ng = move_find_gates(m + text->sh_offset, text->sh_size, text->sh_addr,
                                     fetch, flag, gates, 8);
     snprintf(buf, sizeof buf, "%zu found, first %#lx (expected 0x290a3e2)", ng,
              ng ? (unsigned long)gates[0] : 0UL);
@@ -85,8 +88,8 @@ int main(void)
     /* A scanner that matches anything is worthless — check it rejects noise. */
     static uint8_t noise[1 << 20];
     for (size_t i = 0; i < sizeof noise; i++) noise[i] = (uint8_t)(i * 31 + (i >> 8));
-    bg3_move_sig junk;
-    ok(bg3_find_move_sig(noise, sizeof noise, 0x400000, &junk) == 0,
+    move_sig junk;
+    ok(move_find_sig(noise, sizeof noise, 0x400000, &junk) == 0,
        "rejects 1 MB of non-matching bytes", NULL);
 
     /* And that the action cross-check is actually load-bearing: the encoding
@@ -96,7 +99,7 @@ int main(void)
     memcpy(stub, (const uint8_t[]){0x48,0x8b,0x05,0,0,0,0, 0x48,0x8b,0x0d,0,0,0,0,
                                    0x80,0xb8,0x9c,0x13,0,0,0x00, 0x74,0x0d,
                                    0xf2,0x0f,0x10,0xa8,0x94,0x13,0,0}, 31);
-    ok(bg3_find_move_sig(stub, sizeof stub, 0x400000, &junk) == 0,
+    ok(move_find_sig(stub, sizeof stub, 0x400000, &junk) == 0,
        "encoding match without the four polled actions is rejected", NULL);
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASSED", fails);

@@ -1,41 +1,54 @@
 CC      ?= gcc
-CFLAGS  ?= -O2 -g -Wall -Wextra -fvisibility=hidden
+CFLAGS  ?= -O2 -g -Wall -Wextra
 SDL_CFLAGS := $(shell pkg-config --cflags sdl2)
 SDL_LIBS   := $(shell pkg-config --libs sdl2)
 BUILD   := build
 
-.PHONY: all test clean
+# The extender lives in its own repo and is vendored here as a submodule. The
+# mod ships as one file with the host statically inside it, so users install a
+# single .so and set one LD_PRELOAD.
+SE      := vendor/bg3lese
+SE_LIB  := $(SE)/build/libbg3lese.a
+INC     := -I$(SE)/include -I$(SE)/src $(SDL_CFLAGS)
+
+# --whole-archive is mandatory, not a tuning flag: this plugin never references
+# anything in the core, so ordinary archive semantics would drop the extender's
+# main.o and with it the constructor and the SDL_PollEvent interposer. The
+# result would link and load cleanly and do nothing at all.
+SE_LINK := -Wl,--whole-archive $(SE_LIB) -Wl,--no-whole-archive
+
+.PHONY: all test clean se
 all: $(BUILD)/bg3le.so $(BUILD)/bg3le-check
 
 $(BUILD):
 	@mkdir -p $@
 
-# The shim itself. Exported visibility on SDL_PollEvent only — everything else
-# stays hidden so we cannot accidentally interpose a symbol the game relies on.
-$(BUILD)/bg3le.so: src/bg3le.c src/symres.c src/sigscan.c src/hook.c src/symres.h src/sigscan.h src/hook.h | $(BUILD)
-	$(CC) $(CFLAGS) -fPIC -shared -o $@ src/bg3le.c src/symres.c src/sigscan.c src/hook.c $(SDL_CFLAGS) -ldl
+# Build the vendored extender. Auto-inits the submodule so a plain `git clone`
+# followed by `make` works.
+$(SE_LIB):
+	@test -f $(SE)/Makefile || git submodule update --init --recursive
+	@$(MAKE) -C $(SE) build/libbg3lese.a
 
-$(BUILD)/test_symres: src/test_symres.c src/symres.c src/symres.h | $(BUILD)
-	$(CC) $(CFLAGS) -fPIE -pie -o $@ src/test_symres.c src/symres.c
+se: $(SE_LIB)
+
+$(BUILD)/bg3le.so: src/wasd.c src/movesig.c src/movesig.h $(SE_LIB) | $(BUILD)
+	$(CC) $(CFLAGS) -fPIC -shared $(INC) -o $@ src/wasd.c src/movesig.c \
+	  $(SE_LINK) -ldl
+
+$(BUILD)/bg3le-check: src/check.c src/movesig.c $(SE)/src/scan.c | $(BUILD)
+	$(CC) $(CFLAGS) $(INC) -o $@ $^
+
+$(BUILD)/test_movesig: src/test_movesig.c src/movesig.c $(SE)/src/scan.c | $(BUILD)
+	$(CC) $(CFLAGS) $(INC) -o $@ $^
 
 $(BUILD)/sdl_harness: test/sdl_harness.c | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $< $(SDL_CFLAGS) $(SDL_LIBS)
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -o $@ $< $(SDL_LIBS)
 
-test: $(BUILD)/test_symres $(BUILD)/test_sigscan $(BUILD)/test_hook $(BUILD)/bg3le.so $(BUILD)/sdl_harness
-	@./$(BUILD)/test_symres
-	@./$(BUILD)/test_sigscan
-	@./$(BUILD)/test_hook
+test: $(BUILD)/test_movesig $(BUILD)/bg3le.so $(BUILD)/sdl_harness
+	@./$(BUILD)/test_movesig
 	@echo
 	@./test/run_shim_test.sh $(BUILD)
 
 clean:
 	rm -rf $(BUILD)
-
-$(BUILD)/test_sigscan: src/test_sigscan.c src/sigscan.c src/sigscan.h | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ src/test_sigscan.c src/sigscan.c
-
-$(BUILD)/bg3le-check: src/check.c src/sigscan.c src/sigscan.h | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ src/check.c src/sigscan.c
-
-$(BUILD)/test_hook: src/test_hook.c src/hook.c src/hook.h | $(BUILD)
-	$(CC) $(CFLAGS) -fcf-protection=none -o $@ src/test_hook.c src/hook.c
+	@test -f $(SE)/Makefile && $(MAKE) -C $(SE) clean || true
