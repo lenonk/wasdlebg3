@@ -25,13 +25,13 @@ check() { # name expected actual
 }
 
 base=$(./"$B"/sdl_harness | grep '^RESULT')
-check "baseline passes all 6 keys through" "RESULT keys=6 other=0" "$base"
+check "baseline passes all 6 keys through" "RESULT keys=6 other=0 motions=0" "$base"
 
 sup=$("${SHIM[@]}" ./"$B"/sdl_harness | grep '^RESULT')
-check "shim hides all 4 WASD keys" "RESULT keys=2 other=0" "$sup"
+check "shim hides all 4 WASD keys" "RESULT keys=2 other=0 motions=0" "$sup"
 
 off=$("${SHIM[@]}" BG3LE_SUPPRESS=0 ./"$B"/sdl_harness | grep '^RESULT')
-check "BG3LE_SUPPRESS=0 restores all keys" "RESULT keys=6 other=0" "$off"
+check "BG3LE_SUPPRESS=0 restores all keys" "RESULT keys=6 other=0 motions=0" "$off"
 
 order=$("${SHIM[@]}" ./"$B"/sdl_harness | awk '/GAME SAW key/{printf "%s ", $4}')
 check "unrelated keys pass through in order" "X Space " "$order"
@@ -47,7 +47,7 @@ check "BG3LE_WALK_KEY=none still passes the key" "2" \
 
 # Typing a save name must not be eaten, and must not walk the character.
 txt=$("${SHIM[@]}" ./"$B"/sdl_harness textinput | grep '^RESULT')
-check "WASD reaches the game while typing" "RESULT keys=4 other=0" "$txt"
+check "WASD reaches the game while typing" "RESULT keys=4 other=0 motions=0" "$txt"
 
 # Losing focus with a key held must not leave the character walking.
 foc=$(env BG3LE_FORCE_HOST=1 BG3LE_INPUT_ONLY=1 BG3LE_TRACE=1 \
@@ -66,6 +66,39 @@ BG3LE_LOG="$TMP/loud.log" BG3LE_VERBOSE=1 LD_PRELOAD=./"$B"/bg3le.so \
 check "BG3LE_VERBOSE=1 explains why it went idle" "1" \
       "$(grep -c 'not Baldur' "$TMP/loud.log")"
 check "no plugin runs outside the game" "0" "$(grep -c 'wasd:' "$TMP/loud.log")"
+
+echo
+echo "=== camlook: right-drag becomes the game's own look drag ==="
+
+# A right-click with no movement must still reach the game intact, or context
+# menus break -- which would be a worse regression than the feature is a win.
+clk=$("${SHIM[@]}" ./"$B"/sdl_harness rmbclick | grep 'GAME SAW btn' \
+      | awk '{$1=$1};1' | tr '\n' ',')
+check "a plain right-click passes through, in order" "GAME SAW btn right down,GAME SAW btn right up," "$clk"
+
+drag=$("${SHIM[@]}" ./"$B"/sdl_harness rmbdrag)
+check "a right-drag is delivered as the look button" "1" \
+      "$(grep -c 'GAME SAW btn middle down' <<<"$drag")"
+check "and released on mouse-up" "1" "$(grep -c 'GAME SAW btn middle up' <<<"$drag")"
+check "the right button never reaches the game" "0" \
+      "$(grep -c 'GAME SAW btn right' <<<"$drag")"
+check "motion still reaches the game to drive rotation" "2" \
+      "$(grep -c 'GAME SAW motion' <<<"$drag")"
+
+# The button-down must precede the motion that started the drag, or the game
+# misses the first frame of rotation.
+first=$(grep -E 'GAME SAW (btn|motion)' <<<"$drag" | head -1 | awk '{$1=$1};1')
+check "the press is delivered before the motion" "GAME SAW btn middle down" "$first"
+
+lmb=$("${SHIM[@]}" ./"$B"/sdl_harness lmbdrag | grep -c 'GAME SAW btn left')
+check "left-drag is left alone" "2" "$lmb"
+
+off=$("${SHIM[@]}" BG3LE_LOOK=0 ./"$B"/sdl_harness rmbdrag | grep -c 'GAME SAW btn right')
+check "BG3LE_LOOK=0 disables it entirely" "2" "$off"
+
+alt=$("${SHIM[@]}" BG3LE_LOOK_BUTTON=left ./"$B"/sdl_harness rmbdrag \
+      | grep -c 'GAME SAW btn left')
+check "BG3LE_LOOK_BUTTON picks a different button" "2" "$alt"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASSED"; else echo "FAILED ($fails)"; fi

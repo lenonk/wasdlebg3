@@ -25,14 +25,24 @@ $(BUILD):
 
 # Build the vendored extender. Auto-inits the submodule so a plain `git clone`
 # followed by `make` works.
-$(SE_LIB):
+#
+# FORCE, because a rule with no prerequisites is satisfied by the file merely
+# existing: bumping the submodule would leave a stale libbg3lese.a in place and
+# silently link plugins against the wrong ABI. Recursing every time is cheap and
+# the inner make no-ops when it is already current.
+$(SE_LIB): FORCE
 	@test -f $(SE)/Makefile || git submodule update --init --recursive
-	@$(MAKE) -C $(SE) build/libbg3lese.a
+	@$(MAKE) -s -C $(SE) build/libbg3lese.a
+
+.PHONY: FORCE
+FORCE:
 
 se: $(SE_LIB)
 
-$(BUILD)/bg3le.so: src/wasd.c src/movesig.c src/movesig.h $(SE_LIB) | $(BUILD)
-	$(CC) $(CFLAGS) -fPIC -shared $(INC) -o $@ src/wasd.c src/movesig.c \
+PLUGINS := src/wasd.c src/camlook.c
+
+$(BUILD)/bg3le.so: $(PLUGINS) src/movesig.c src/movesig.h $(SE_LIB) | $(BUILD)
+	$(CC) $(CFLAGS) -fPIC -shared $(INC) -o $@ $(PLUGINS) src/movesig.c \
 	  $(SE_LINK) -ldl
 
 $(BUILD)/bg3le-check: src/check.c src/movesig.c $(SE)/src/scan.c | $(BUILD)

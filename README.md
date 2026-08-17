@@ -1,11 +1,14 @@
 # wasdlebg3
 
-**WASD movement for the native Linux build of Baldur's Gate 3.** No Proton, no Windows
-Script Extender, no remapping your keybinds.
+**Keyboard-and-mouse comfort for the native Linux build of Baldur's Gate 3.** No Proton,
+no Windows Script Extender, no remapping your keybinds.
 
-Your character walks with W/A/S/D through the game's *own* movement code — the same path
-an analog stick drives — so you get real locomotion, animation and collision rather than
-synthesised mouse clicks. Movement is camera-relative: forward means away from the camera.
+- **WASD movement.** Your character walks through the game's *own* movement code — the
+  same path an analog stick drives — so you get real locomotion, animation and collision
+  rather than synthesised mouse clicks. Movement is camera-relative.
+- **Hold right-mouse to rotate the camera.** Right-drag becomes the drag the game already
+  handles, so the rotation and its feel are the game's own. A plain right-click still
+  opens context menus.
 
 Ships as a single `LD_PRELOAD` library, `bg3le.so`. It patches nothing on disk and leaves
 no trace after you quit.
@@ -74,7 +77,9 @@ Launch the game and hold **W**. That's it.
 |---|---|
 | **W A S D** | move, relative to the camera |
 | **Left Shift** (hold) | walk instead of run |
-| everything else | untouched — jump, interact, hotbar, camera all work normally |
+| **Right-mouse drag** | rotate the camera |
+| **Right-click** (no drag) | unchanged — context menus still work |
+| everything else | untouched — jump, interact and the hotbar all work normally |
 
 WASD are hidden from the game while you move, so they no longer pan the camera. Everything
 else passes through in order. Typing in a text field (naming a save, renaming a character)
@@ -94,6 +99,10 @@ are what you want; the rest are for troubleshooting.
 | `BG3LE_MOVE` | `1` | drive movement (`0` = observe only) |
 | `BG3LE_GATE` | `1` | open the game's controller-mode gate (`0` disables the mod) |
 | `BG3LE_INPUT_ONLY` | `0` | filter input without moving, for diagnosing an unrecognised build |
+| `BG3LE_LOOK` | `1` | enable right-drag camera rotation |
+| `BG3LE_LOOK_TRIGGER` | `right` | the button you hold: `left` `middle` `right` `x1` `x2` |
+| `BG3LE_LOOK_BUTTON` | `middle` | the button the game already rotates on |
+| `BG3LE_LOOK_THRESHOLD` | `4` | pixels of travel before a click becomes a drag |
 | `BG3LE_LOG` | `/tmp/bg3le.log` | log file |
 | `BG3LE_TRACE` | `0` | per-keystroke and per-frame detail |
 | `BG3LE_VERBOSE` | `0` | also log from Steam's helper processes |
@@ -159,6 +168,18 @@ Two facts about the binary carry it, each verified against it:
    entirely outside controller mode. Writing the flag loses a per-frame race against the
    engine's input-mode arbiter — measured, it reset ours on every single frame — so the
    six-byte branch is NOPed instead, as a single aligned atomic store.
+
+### Camera rotation
+
+The camera mod implements no rotation maths at all. The game imports no
+`SDL_SetRelativeMouseMode` and no `SDL_CaptureMouse`, only `SDL_WarpMouseInWindow` and
+`SDL_ShowCursor` — the classic hide-the-cursor-and-warp-it-back idiom — so it already has
+smooth drag-rotation and reads the deltas itself. All the mod does is swallow the right
+button and hand the game the look button in its place.
+
+That means it patches nothing and needs no addresses, so unlike the movement half it
+cannot be broken by a game update moving code. The only assumption is *which* button the
+game rotates on, and that is one environment variable.
 
 **No addresses are hardcoded.** At load time the plugin finds its signature, recovers the
 global and both field offsets from instruction encodings, derives the mode flag from call
