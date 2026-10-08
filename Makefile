@@ -52,6 +52,18 @@ $(BUILD)/plugins/wasd.so: src/wasd.c src/movesig.c src/movesig.h $(SE_LIB) | $(B
 	@mkdir -p $(BUILD)/plugins
 	$(CC) $(CFLAGS) -fPIC -shared $(INC) -o $@ src/wasd.c src/movesig.c
 
+# bg3le plugin: dropped into ~/.local/share/bg3le/plugins, loaded by bg3le
+# itself (no LD_PRELOAD). bg3le offers no scanning or patching, so bg3lese's
+# scan, patch and host sources are compiled in.
+$(BUILD)/bg3le/linux_native_wasd.so: src/bg3le_plugin.c src/movesig.c src/movesig.h vendor/bg3le/bg3le_plugin.h \
+                        $(SE)/src/scan.c $(SE)/src/patch.c $(SE)/src/host.c | $(BUILD)
+	@mkdir -p $(BUILD)/bg3le
+	$(CC) $(CFLAGS) -fPIC -shared -fvisibility=hidden -Ivendor/bg3le $(INC) -o $@ \
+	  src/bg3le_plugin.c src/movesig.c $(SE)/src/scan.c $(SE)/src/patch.c $(SE)/src/host.c
+
+bg3le: $(BUILD)/bg3le/linux_native_wasd.so
+.PHONY: bg3le
+
 $(BUILD)/bg3le-check: src/check.c src/movesig.c $(SE)/src/scan.c | $(BUILD)
 	$(CC) $(CFLAGS) $(INC) -o $@ $^
 
