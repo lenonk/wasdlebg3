@@ -95,6 +95,14 @@ LD_PRELOAD=/home/YOURNAME/bg3le/bg3lese.so %command%
 The host loads every `.so` in `plugins/` beside it, refuses any built against a different
 ABI, and refuses a second copy of a plugin it already loaded.
 
+## With bg3le
+
+If you run [bg3le](https://github.com/lenonk/bg3le), the native-Linux script extender,
+this mod also builds as a bg3le plugin, `linux_native_wasd.so`. bg3le loads it from its
+plugins directory, so there is no launch option to set, and its options are bg3le
+settings. `make bg3le` builds it and `bg3le/package.sh` makes the release zip; see
+[bg3le/README.md](bg3le/README.md). Don't preload this mod's `bg3le.so` as well.
+
 ## Controls
 
 | input | what it does |

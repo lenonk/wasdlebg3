@@ -10,3 +10,5 @@ build/
 __pycache__/
 *.pyc
 analysis/dossier.json
+build-sniper/
+dist/
