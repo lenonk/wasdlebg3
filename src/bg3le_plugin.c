@@ -14,7 +14,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#define WASD_VERSION "0.3.1-bg3le"
+#define WASD_VERSION "1.0"
 #define MAX_GATES 8
 
 enum { KEY_W = 1, KEY_A = 2, KEY_S = 4, KEY_D = 8, KEY_WALK = 16 };
