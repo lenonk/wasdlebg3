@@ -13,8 +13,10 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
-#define WASD_VERSION "1.1"
+#define WASD_VERSION "1.2"
 #define MAX_GATES 8
 
 enum { KEY_W = 1, KEY_A = 2, KEY_S = 4, KEY_D = 8, KEY_WALK = 16 };
@@ -43,6 +45,14 @@ static _Atomic unsigned g_keys;
 static int g_enabled = 1;       /* WASD move the character, not the camera */
 static unsigned g_game_keys;    /* WASD the game saw go down; theirs until released */
 static int g_toggle_down;       /* the toggle key's key-down reached us */
+
+/* The gates opened at load. Camera mode closes them again: while one is open
+ * the game also moves the character from its own CharacterMove* bindings,
+ * which BG3WASD's keybinding patch sets to WASD. */
+static uintptr_t g_gate_at[MAX_GATES];
+static uint8_t g_gate_original[MAX_GATES][6];
+static size_t g_ngates;
+static const uint8_t NOP6[6] = {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00};   /* as patch_nop writes */
 
 static SDL_bool (*sdl_text_input_active)(void);
 
@@ -110,10 +120,33 @@ static void wasd_on_frame(void *user, double dt)
     if (g_have_ctl) drive_movement();
 }
 
+/* One aligned 8-byte store per gate, as patch.c writes them, so the game thread
+ * never sees half a branch. patch_restore_all still puts the originals back at exit. */
+static void set_gates(int open)
+{
+    const uintptr_t pagesize = (uintptr_t)sysconf(_SC_PAGESIZE);
+    for (size_t i = 0; i < g_ngates; i++) {
+        const uintptr_t at = g_gate_at[i], word = at & ~(uintptr_t)7;
+        if (mprotect((void *)(word & ~(pagesize - 1)), (word & (pagesize - 1)) + 8,
+                     PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            host->warn(self, "gate @%#lx could not be made writable", at);
+            continue;
+        }
+        uint64_t w = __atomic_load_n((uint64_t *)word, __ATOMIC_SEQ_CST);
+        uint8_t buf[8];
+        memcpy(buf, &w, sizeof buf);
+        memcpy(buf + (at - word), open ? NOP6 : g_gate_original[i], 6);
+        memcpy(&w, buf, sizeof w);
+        __atomic_store_n((uint64_t *)word, w, __ATOMIC_SEQ_CST);
+    }
+    trace("movement gate(s) %s", open ? "opened" : "closed");
+}
+
 static void toggle(void)
 {
     g_enabled = !g_enabled;
     if (!g_enabled) atomic_fetch_and(&g_keys, ~(unsigned)MOVE_KEYS);
+    set_gates(g_enabled);
     host->log(self, "WASD %s", g_enabled ? "moves the character" : "moves the camera");
 }
 
@@ -219,8 +252,14 @@ static int open_gates(const host_image *img)
         memcpy(expect, (const void *)gates[i], sizeof expect);
         if (expect[0] != 0x0F || expect[1] != 0x84) continue;
         int rc = patch_nop(gates[i], 6, expect);
-        if (rc == PATCH_OK) opened++;
-        else host->log(self, "gate @%#lx not patched (rc=%d)", gates[i], rc);
+        if (rc == PATCH_OK) {
+            g_gate_at[g_ngates] = gates[i];
+            memcpy(g_gate_original[g_ngates], expect, sizeof expect);
+            g_ngates++;
+            opened++;
+        } else {
+            host->log(self, "gate @%#lx not patched (rc=%d)", gates[i], rc);
+        }
     }
     if (!opened) return -1;
     host->log(self, "opened %zu of %zu movement gate(s)", opened, ng);
