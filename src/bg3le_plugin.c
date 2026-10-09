@@ -14,7 +14,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#define WASD_VERSION "1.0"
+#define WASD_VERSION "1.1"
 #define MAX_GATES 8
 
 enum { KEY_W = 1, KEY_A = 2, KEY_S = 4, KEY_D = 8, KEY_WALK = 16 };
@@ -27,6 +27,7 @@ static bg3le_plugin *self;
 static int cfg_move = 1, cfg_suppress = 1, cfg_trace = 0, cfg_gate = 1, cfg_input_only = 0;
 static int cfg_walk_key = SDL_SCANCODE_LSHIFT;   /* 0 = no walk modifier */
 static float cfg_walk_speed = 0.5f;
+static int cfg_toggle_key = SDL_SCANCODE_CAPSLOCK; /* 0 = no toggle */
 
 static move_sig g_sig;
 static move_ctl g_ctl;          /* client game thread only */
@@ -37,6 +38,11 @@ static unsigned long g_frames;
 
 /* Written by the event handler (main thread), read by the frame handler. */
 static _Atomic unsigned g_keys;
+
+/* Main thread only. */
+static int g_enabled = 1;       /* WASD move the character, not the camera */
+static unsigned g_game_keys;    /* WASD the game saw go down; theirs until released */
+static int g_toggle_down;       /* the toggle key's key-down reached us */
 
 static SDL_bool (*sdl_text_input_active)(void);
 
@@ -104,6 +110,13 @@ static void wasd_on_frame(void *user, double dt)
     if (g_have_ctl) drive_movement();
 }
 
+static void toggle(void)
+{
+    g_enabled = !g_enabled;
+    if (!g_enabled) atomic_fetch_and(&g_keys, ~(unsigned)MOVE_KEYS);
+    host->log(self, "WASD %s", g_enabled ? "moves the character" : "moves the camera");
+}
+
 /* Main thread, for every event the game is about to receive. */
 static int wasd_on_event(void *user, SDL_Event *ev)
 {
@@ -120,19 +133,37 @@ static int wasd_on_event(void *user, SDL_Event *ev)
 
     if (ev->type != SDL_KEYDOWN && ev->type != SDL_KEYUP) return 0;
 
+    int text = sdl_text_input_active != NULL && sdl_text_input_active();
+    trace("event %s scancode %d repeat %d text_input %d enabled %d",
+          ev->type == SDL_KEYDOWN ? "down" : "up", (int)ev->key.keysym.scancode,
+          (int)ev->key.repeat, text, g_enabled);
+
     /* While a text field is focused every key belongs to the game: typing
      * "Wasteland" into a save name must not walk the character across the room. */
-    if (sdl_text_input_active != NULL && sdl_text_input_active()) {
+    if (text) {
         if (atomic_fetch_and(&g_keys, ~(unsigned)MOVE_KEYS) & MOVE_KEYS)
             trace("movement released (text input)");
         return 0;
     }
 
-    unsigned k = atomic_load(&g_keys);
-    if (ev->key.repeat) return cfg_suppress && (k & MOVE_KEYS);
-
     int down = ev->type == SDL_KEYDOWN;
     int sc = ev->key.keysym.scancode;
+
+    if (cfg_toggle_key != 0 && sc == cfg_toggle_key) {
+        /* MCM binds Caps Lock to its sidebar by default and cancels the key-down
+         * before plugins see it, so a key-up with no key-down toggles too. */
+        if (down && !ev->key.repeat) {
+            g_toggle_down = 1;
+            toggle();
+        } else if (!down) {
+            if (!g_toggle_down) toggle();
+            g_toggle_down = 0;
+        }
+        return 1;
+    }
+
+    unsigned k = atomic_load(&g_keys);
+    if (ev->key.repeat) return cfg_suppress && (k & MOVE_KEYS);
 
     /* The walk modifier is observed but never consumed: it is a real binding in
      * the game, and stealing it would break whatever it is bound to. */
@@ -148,6 +179,11 @@ static int wasd_on_event(void *user, SDL_Event *ev)
     case SDL_SCANCODE_S: bit = KEY_S; break;
     case SDL_SCANCODE_D: bit = KEY_D; break;
     default: return 0;   /* jump, interact and everything else pass through */
+    }
+    if (!g_enabled || (g_game_keys & bit)) {
+        if (down) g_game_keys |= bit;
+        else g_game_keys &= ~bit;
+        return 0;
     }
     if (!!(k & bit) != down) {
         set_key(bit, down);
@@ -213,6 +249,7 @@ BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host *h, bg3le_plugin *p)
     host->add_setting(self, "suppress", BG3LE_SETTING_BOOL, &cfg_suppress, 0, 0);
     host->add_setting(self, "walk_key", BG3LE_SETTING_INT, &cfg_walk_key, 0, 511);
     host->add_setting(self, "walk_speed", BG3LE_SETTING_FLOAT, &cfg_walk_speed, 0.05, 1.0);
+    host->add_setting(self, "toggle_key", BG3LE_SETTING_INT, &cfg_toggle_key, 0, 511);
     host->add_setting(self, "gate", BG3LE_SETTING_BOOL, &cfg_gate, 0, 0);
     host->add_setting(self, "input_only", BG3LE_SETTING_BOOL, &cfg_input_only, 0, 0);
     host->add_setting(self, "trace", BG3LE_SETTING_BOOL, &cfg_trace, 0, 0);
@@ -260,8 +297,8 @@ BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host *h, bg3le_plugin *p)
         return -1;
     }
 
-    host->log(self, "ready (move=%d suppress=%d walk_key=%d@%.2f)", cfg_move, cfg_suppress,
-              cfg_walk_key, (double)cfg_walk_speed);
+    host->log(self, "ready (move=%d suppress=%d walk_key=%d@%.2f toggle_key=%d)", cfg_move,
+              cfg_suppress, cfg_walk_key, (double)cfg_walk_speed, cfg_toggle_key);
     g_ready = 1;
     g_can_move = can_move;
     return 0;

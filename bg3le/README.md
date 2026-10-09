@@ -34,11 +34,17 @@ when it finds one.
 |---|---|
 | **W A S D** | move, relative to the camera |
 | **Left Shift** (hold) | walk instead of run |
+| **Caps Lock** | switch WASD between moving the character and moving the camera |
 | everything else | untouched |
 
 WASD are hidden from the game while the plugin drives them, so they no longer
-pan the camera. Typing in a text field leaves every key to the game, and losing
-window focus releases movement.
+pan the camera; Caps Lock hands them back to the game, and pressing it again
+takes them back. Each launch starts with WASD moving the character. Typing in a
+text field leaves every key to the game, and losing window focus releases
+movement.
+
+MCM binds Caps Lock to "Toggle MCM sidebar" by default, so while MCM's window
+is open Caps Lock does both. Rebind one of them if that is in the way.
 
 ## Settings
 
@@ -50,11 +56,12 @@ with `Ext.Plugins.Set("LinuxNativeWASD", id, value)`.
 |---|---|---|
 | `walk_key` | `225` | SDL scancode of the walk modifier (225 is Left Shift, 229 Right Shift, 224 Left Ctrl); `0` turns walking off |
 | `walk_speed` | `0.5` | walk speed as a fraction of run, 0.05 to 1 |
+| `toggle_key` | `57` | SDL scancode of the character/camera switch (57 is Caps Lock); `0` turns the switch off |
 | `suppress` | `true` | hide WASD from the game's own bindings |
 | `move` | `true` | drive movement (`false` observes only) |
 | `gate` | `true` | open the game's controller-mode gate at load |
 | `input_only` | `false` | filter input without moving, for diagnosing an unrecognised game build |
-| `trace` | `false` | log every key and movement change |
+| `trace` | `false` | log every key event and movement change |
 
 Its lines in bg3le's log (`~/.local/share/bg3le/logs`) start with
 `plugin LinuxNativeWASD:`. On a supported build they include
