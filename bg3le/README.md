@@ -43,6 +43,11 @@ takes them back. Each launch starts with WASD moving the character. Typing in a
 text field leaves every key to the game, and losing window focus releases
 movement.
 
+As [BG3WASD](https://github.com/Ch4nKyy/BG3WASD) by Ch4nKyy does on Windows,
+WASD switch to moving the camera when combat starts and back to moving the
+character when it ends, and a save loaded in combat starts with the camera.
+Caps Lock still switches in between. `auto_toggle` turns this off.
+
 MCM binds Caps Lock to "Toggle MCM sidebar" by default, so while MCM's window
 is open Caps Lock does both. Rebind one of them if that is in the way.
 
@@ -57,6 +62,7 @@ with `Ext.Plugins.Set("LinuxNativeWASD", id, value)`.
 | `walk_key` | `225` | SDL scancode of the walk modifier (225 is Left Shift, 229 Right Shift, 224 Left Ctrl); `0` turns walking off |
 | `walk_speed` | `0.5` | walk speed as a fraction of run, 0.05 to 1 |
 | `toggle_key` | `57` | SDL scancode of the character/camera switch (57 is Caps Lock); `0` turns the switch off |
+| `auto_toggle` | `true` | move the camera in combat and the character out of it |
 | `suppress` | `true` | hide WASD from the game's own bindings |
 | `move` | `true` | drive movement (`false` observes only) |
 | `gate` | `true` | open the game's controller-mode gate at load |

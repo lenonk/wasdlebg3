@@ -7,16 +7,18 @@
 #include "host.h"
 #include "movesig.h"
 #include "patch.h"
+#include "scan.h"
 
 #include <SDL2/SDL.h>
 
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define WASD_VERSION "1.2"
+#define WASD_VERSION "1.3"
 #define MAX_GATES 8
 
 enum { KEY_W = 1, KEY_A = 2, KEY_S = 4, KEY_D = 8, KEY_WALK = 16 };
@@ -30,6 +32,7 @@ static int cfg_move = 1, cfg_suppress = 1, cfg_trace = 0, cfg_gate = 1, cfg_inpu
 static int cfg_walk_key = SDL_SCANCODE_LSHIFT;   /* 0 = no walk modifier */
 static float cfg_walk_speed = 0.5f;
 static int cfg_toggle_key = SDL_SCANCODE_CAPSLOCK; /* 0 = no toggle */
+static int cfg_auto_toggle = 1;  /* camera in combat, character out of it, as BG3WASD */
 
 static move_sig g_sig;
 static move_ctl g_ctl;          /* client game thread only */
@@ -41,8 +44,12 @@ static unsigned long g_frames;
 /* Written by the event handler (main thread), read by the frame handler. */
 static _Atomic unsigned g_keys;
 
+/* WASD move the character, not the camera. Changed only through set_mode, from
+ * the main thread (the toggle key) and the game thread (combat). */
+static _Atomic int g_enabled = 1;
+static pthread_mutex_t g_mode_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* Main thread only. */
-static int g_enabled = 1;       /* WASD move the character, not the camera */
 static unsigned g_game_keys;    /* WASD the game saw go down; theirs until released */
 static int g_toggle_down;       /* the toggle key's key-down reached us */
 
@@ -142,12 +149,117 @@ static void set_gates(int open)
     trace("movement gate(s) %s", open ? "opened" : "closed");
 }
 
+/* enabled: 1 character, 0 camera, -1 the other one. */
+static void set_mode(int enabled, const char *why)
+{
+    pthread_mutex_lock(&g_mode_lock);
+    if (enabled < 0) enabled = !atomic_load(&g_enabled);
+    if (enabled != atomic_load(&g_enabled)) {
+        atomic_store(&g_enabled, enabled);
+        if (!enabled) atomic_fetch_and(&g_keys, ~(unsigned)MOVE_KEYS);
+        set_gates(enabled);
+        host->log(self, "WASD %s%s", enabled ? "moves the character" : "moves the camera", why);
+    }
+    pthread_mutex_unlock(&g_mode_lock);
+}
+
 static void toggle(void)
 {
-    g_enabled = !g_enabled;
-    if (!g_enabled) atomic_fetch_and(&g_keys, ~(unsigned)MOVE_KEYS);
-    set_gates(g_enabled);
-    host->log(self, "WASD %s", g_enabled ? "moves the character" : "moves the camera");
+    set_mode(-1, "");
+}
+
+/* ------------------------------------------------------------- auto toggle */
+
+/* BG3WASD's AutoToggleMovementMode (Ch4nKyy, github.com/Ch4nKyy/BG3WASD), from the
+ * same camera flag: UpdateCamera's camera, whose mode flags (+0xA8) have bit 0 set
+ * in combat. Here the camera is the first field of its fourth argument; on Windows
+ * it is at +48. */
+#define CAMERA_MODE_FLAGS 0xA8
+#define CAMERA_MODE_COMBAT 0x1u
+
+/* The one call to UpdateCamera, and UpdateCamera's prologue to check it against. */
+static const char UPDATE_CAMERA_CALL[] = "48 8b 7c 24 ?? 48 8b 74 24 ?? 48 8b 54 24 ?? 4c 89 e9 e8";
+#define UPDATE_CAMERA_CALL_AT 18
+static const char UPDATE_CAMERA[] =
+    "55 41 57 41 56 41 55 41 54 53 48 81 ec ?? ?? 00 00 48 8b 41 08 49 89 ce 49 89 f5";
+
+/* Six integer arguments, so whatever it takes in registers passes through. */
+typedef uint64_t (*update_camera_fn)(void *, void *, void *, void **, void *, void *);
+static update_camera_fn o_update_camera;
+static int g_combat = -1;       /* game thread: the flag last seen, -1 before the first */
+
+static uint64_t update_camera_hook(void *a1, void *a2, void *a3, void **a4, void *a5, void *a6)
+{
+    const uint8_t *camera = a4 ? (const uint8_t *)*a4 : NULL;
+    if (camera) {
+        uint32_t flags;
+        memcpy(&flags, camera + CAMERA_MODE_FLAGS, sizeof flags);
+        const int combat = (flags & CAMERA_MODE_COMBAT) != 0;
+        /* As BG3WASD: tracked whatever the setting, acted on as it changes. */
+        if (combat != g_combat) {
+            g_combat = combat;
+            if (cfg_auto_toggle) set_mode(!combat, combat ? " (in combat)" : " (out of combat)");
+        }
+    }
+    return o_update_camera(a1, a2, a3, a4, a5, a6);
+}
+
+/* A page within rel32 reach of `near`, as bg3lese's patch.c finds its islands. */
+static uint8_t *island_near(uintptr_t near)
+{
+    const uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+    for (uintptr_t delta = pg; delta < 0x60000000; delta += 16 * pg) {
+        for (int dir = 0; dir < 2; dir++) {
+            const uintptr_t at = (dir ? near + delta : near - delta) & ~(pg - 1);
+            void *p = mmap((void *)at, pg, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (p != MAP_FAILED) return p;
+        }
+    }
+    return NULL;
+}
+
+static int hook_update_camera(const host_image *img)
+{
+    scan_pat call_pat, fn_pat;
+    uintptr_t hits[2];
+    if (scan_parse(UPDATE_CAMERA_CALL, &call_pat) != 0 || scan_parse(UPDATE_CAMERA, &fn_pat) != 0)
+        return -1;
+    if (scan_find(&call_pat, img->code, img->len, img->base_va, 0, 0, hits, 2) != 1) {
+        host->warn(self, "UpdateCamera's call not found; auto_toggle is off");
+        return -1;
+    }
+    const uintptr_t call = hits[0] + UPDATE_CAMERA_CALL_AT;
+    int32_t disp;
+    memcpy(&disp, (const void *)(call + 1), sizeof disp);
+    const uintptr_t target = call + 5 + (intptr_t)disp;
+    if (scan_find(&fn_pat, img->code, img->len, img->base_va, target, target + fn_pat.len, hits, 1) != 1) {
+        host->warn(self, "the call at %#lx is not to UpdateCamera; auto_toggle is off", call);
+        return -1;
+    }
+
+    /* jmp [rip+0] to the hook: the hook is too far from the game's code for rel32. */
+    uint8_t *island = island_near(call);
+    if (!island) {
+        host->warn(self, "no page near UpdateCamera's call; auto_toggle is off");
+        return -1;
+    }
+    void *hook = (void *)update_camera_hook;
+    const uint8_t jmp[6] = {0xFF, 0x25, 0, 0, 0, 0};
+    memcpy(island, jmp, sizeof jmp);
+    memcpy(island + sizeof jmp, &hook, sizeof hook);
+    mprotect(island, (size_t)sysconf(_SC_PAGESIZE), PROT_READ | PROT_EXEC);
+
+    o_update_camera = (update_camera_fn)target;
+    const int32_t to_island = (int32_t)((intptr_t)island - (intptr_t)(call + 5));
+    int rc = patch_bytes(call + 1, (const uint8_t *)&to_island, (const uint8_t *)&disp, sizeof disp);
+    if (rc != PATCH_OK) {
+        munmap(island, (size_t)sysconf(_SC_PAGESIZE));
+        host->warn(self, "UpdateCamera's call @%#lx not patched (rc=%d); auto_toggle is off", call, rc);
+        return -1;
+    }
+    host->log(self, "UpdateCamera @%#lx hooked at its call @%#lx", target, call);
+    return 0;
 }
 
 /* Main thread, for every event the game is about to receive. */
@@ -289,6 +401,7 @@ BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host *h, bg3le_plugin *p)
     host->add_setting(self, "walk_key", BG3LE_SETTING_INT, &cfg_walk_key, 0, 511);
     host->add_setting(self, "walk_speed", BG3LE_SETTING_FLOAT, &cfg_walk_speed, 0.05, 1.0);
     host->add_setting(self, "toggle_key", BG3LE_SETTING_INT, &cfg_toggle_key, 0, 511);
+    host->add_setting(self, "auto_toggle", BG3LE_SETTING_BOOL, &cfg_auto_toggle, 0, 0);
     host->add_setting(self, "gate", BG3LE_SETTING_BOOL, &cfg_gate, 0, 0);
     host->add_setting(self, "input_only", BG3LE_SETTING_BOOL, &cfg_input_only, 0, 0);
     host->add_setting(self, "trace", BG3LE_SETTING_BOOL, &cfg_trace, 0, 0);
@@ -328,6 +441,7 @@ BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host *h, bg3le_plugin *p)
             can_move = 1;
         }
     }
+    if (can_move) hook_update_camera(&img);
 
     if (host->add_event_handler(self, wasd_on_event, NULL) != 0
         || host->add_frame_handler(self, wasd_on_frame, NULL) != 0) {
@@ -336,8 +450,9 @@ BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host *h, bg3le_plugin *p)
         return -1;
     }
 
-    host->log(self, "ready (move=%d suppress=%d walk_key=%d@%.2f toggle_key=%d)", cfg_move,
-              cfg_suppress, cfg_walk_key, (double)cfg_walk_speed, cfg_toggle_key);
+    host->log(self, "ready (move=%d suppress=%d walk_key=%d@%.2f toggle_key=%d auto_toggle=%d)",
+              cfg_move, cfg_suppress, cfg_walk_key, (double)cfg_walk_speed, cfg_toggle_key,
+              cfg_auto_toggle);
     g_ready = 1;
     g_can_move = can_move;
     return 0;
